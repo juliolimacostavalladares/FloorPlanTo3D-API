@@ -19,12 +19,14 @@ except Exception as _err:
     EZDXF_DRAWING_AVAILABLE = False
     print(f"Aviso: ezdxf.addons.drawing indisponível: {_err}")
 from PIL import Image, ImageDraw
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, send_from_directory
 from flask_cors import CORS
 
 ROOT_DIR = os.path.abspath("./")
 SAVED_PLANS_DIR = os.path.join(ROOT_DIR, "saved_plans")
+TEXTURES_DIR = os.path.join(ROOT_DIR, "textures")
 os.makedirs(SAVED_PLANS_DIR, exist_ok=True)
+os.makedirs(TEXTURES_DIR, exist_ok=True)
 
 application = Flask(__name__)
 cors = CORS(application, resources={r"/*": {"origins": "*"}})
@@ -621,6 +623,58 @@ def download_plan_baked_glb(plan_id):
         )
     return jsonify({"error": "Modelo GLB assado (baked) não encontrado. Execute o bake primeiro."}), 404
 
+
+@application.route('/textures/<path:filename>', methods=['GET'])
+def serve_texture(filename):
+    return send_from_directory(TEXTURES_DIR, filename)
+
+
+@application.route('/api/recraft/generate-texture', methods=['POST'])
+def api_recraft_generate_texture():
+    token = get_recraft_token(request)
+    if not token:
+        return jsonify({
+            "error": "Chave de API Recraft necessária. Informe o token no cabeçalho 'X-Recraft-Token' ou configure RECRAFT_API_TOKEN no servidor."
+        }), 401
+
+    payload = request.get_json(silent=True) or {}
+    target = payload.get('target', 'floor_wood')
+    prompt = payload.get('prompt')
+    model = payload.get('model', 'recraftv4_1')
+
+    try:
+        from recraft_textures import generate_pbr_texture_with_recraft
+        res = generate_pbr_texture_with_recraft(target, token, prompt=prompt, model=model)
+        return jsonify(res)
+    except Exception as e:
+        print(f"Erro ao gerar textura {target}: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+@application.route('/api/recraft/generate-all-textures', methods=['POST'])
+def api_recraft_generate_all_textures():
+    token = get_recraft_token(request)
+    if not token:
+        return jsonify({"error": "Chave de API Recraft necessária."}), 401
+
+    payload = request.get_json(silent=True) or {}
+    model = payload.get('model', 'recraftv4_1')
+    targets = payload.get('targets', [
+        'floor_wood', 'floor_porcelain', 'wall_interior', 'wall_exterior', 'door_wood', 'fabric_sofa'
+    ])
+
+    results = {}
+    from recraft_textures import generate_pbr_texture_with_recraft
+    for t in targets:
+        try:
+            res = generate_pbr_texture_with_recraft(t, token, model=model)
+            results[t] = res
+        except Exception as err:
+            results[t] = {"status": "error", "error": str(err)}
+
+    return jsonify({"status": "completed", "results": results})
 
 
 @application.route('/api/recraft/humanize-floorplan', methods=['POST'])
