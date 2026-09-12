@@ -7,8 +7,19 @@ import base64
 from datetime import datetime
 import requests
 import ezdxf
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+try:
+    from ezdxf.addons.drawing import RenderContext, Frontend
+    from ezdxf.addons.drawing.matplotlib import MatplotlibBackend
+    from ezdxf.addons.drawing.config import Configuration, BackgroundPolicy
+    EZDXF_DRAWING_AVAILABLE = True
+except Exception as _err:
+    EZDXF_DRAWING_AVAILABLE = False
+    print(f"Aviso: ezdxf.addons.drawing indisponível: {_err}")
 from PIL import Image, ImageDraw
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 
 ROOT_DIR = os.path.abspath("./")
@@ -515,6 +526,24 @@ def get_latest_plan():
     return jsonify({"error": "Nenhum plano salvo encontrado"}), 404
 
 
+@application.route('/api/plans/<plan_id>/blueprint.png', methods=['GET'])
+@application.route('/api/plans/<plan_id>/blueprint', methods=['GET'])
+def download_plan_blueprint(plan_id):
+    png_path = os.path.join(SAVED_PLANS_DIR, f"{plan_id}_blueprint.png")
+    if os.path.exists(png_path):
+        return send_file(png_path, mimetype='image/png', as_attachment=True, download_name=f"{plan_id}_planta_baixa_hd.png")
+
+    json_path = os.path.join(SAVED_PLANS_DIR, f"{plan_id}.json")
+    if os.path.exists(json_path):
+        with open(json_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            img_url = data.get('blueprint_hd_url') or data.get('image_url', '')
+            if ',' in img_url:
+                b64 = img_url.split(',', 1)[1]
+                return send_file(io.BytesIO(base64.b64decode(b64)), mimetype='image/png', as_attachment=True, download_name=f"{plan_id}_planta_baixa_hd.png")
+    return jsonify({"error": "Planta baixa não encontrada"}), 404
+
+
 def process_cad_dxf(dxf_bytes, filename="arquivo.dxf"):
     raw_bytes = dxf_bytes if isinstance(dxf_bytes, bytes) else str(dxf_bytes).encode('latin1', errors='ignore')
     
@@ -577,47 +606,75 @@ def process_cad_dxf(dxf_bytes, filename="arquivo.dxf"):
     center_x = (min_x + max_x) / 2.0
     center_y = (min_y + max_y) / 2.0
 
-    # 1. Gerar blueprint 2D vetorial de altíssima definição para o visualizador Split View
-    IMG_SIZE = 1200
-    PAD = 60
-    draw_w = IMG_SIZE - 2 * PAD
-    draw_h = IMG_SIZE - 2 * PAD
-    scale = min(draw_w / cad_w, draw_h / cad_d)
+    # 1. Gerar blueprint 2D vetorial de altíssima definição usando ezdxf.addons.drawing
+    raw_blueprint_png = None
+    b64_blueprint = None
 
-    def to_px(x, y):
-        px = PAD + (x - min_x) * scale
-        py = IMG_SIZE - PAD - (y - min_y) * scale
-        return int(px), int(py)
+    if EZDXF_DRAWING_AVAILABLE:
+        try:
+            fig = plt.figure(figsize=(16, 16), dpi=250)
+            ax = fig.add_axes([0, 0, 1, 1])
+            ctx = RenderContext(doc)
+            out = MatplotlibBackend(ax)
+            cfg = Configuration(
+                background_policy=BackgroundPolicy.CUSTOM,
+                custom_bg_color='#0b0f19'
+            )
+            Frontend(ctx, out, config=cfg).draw_layout(doc.modelspace(), finalize=True)
+            buf = io.BytesIO()
+            fig.savefig(buf, format='png', dpi=250, facecolor='#0b0f19', bbox_inches='tight', pad_inches=0.1)
+            plt.close(fig)
+            raw_blueprint_png = buf.getvalue()
+            b64_blueprint = base64.b64encode(raw_blueprint_png).decode('utf-8')
+            print(f"==> Planta Baixa HD gerada via ezdxf ({len(raw_blueprint_png)} bytes, 250 DPI)")
+        except Exception as draw_err:
+            print(f"Erro ao renderizar via ezdxf.addons.drawing: {draw_err}")
+            raw_blueprint_png = None
+            b64_blueprint = None
 
-    img = Image.new('RGB', (IMG_SIZE, IMG_SIZE), color=(10, 15, 26))
-    draw = ImageDraw.Draw(img)
+    if not b64_blueprint:
+        # Fallback PIL se ezdxf drawing falhar
+        IMG_SIZE = 1200
+        PAD = 60
+        draw_w = IMG_SIZE - 2 * PAD
+        draw_h = IMG_SIZE - 2 * PAD
+        scale = min(draw_w / cad_w, draw_h / cad_d)
 
-    for gx in range(0, IMG_SIZE, 40):
-        draw.line([(gx, 0), (gx, IMG_SIZE)], fill=(18, 28, 45), width=1)
-    for gy in range(0, IMG_SIZE, 40):
-        draw.line([(0, gy), (IMG_SIZE, gy)], fill=(18, 28, 45), width=1)
+        def to_px(x, y):
+            px = PAD + (x - min_x) * scale
+            py = IMG_SIZE - PAD - (y - min_y) * scale
+            return int(px), int(py)
 
-    for p1, p2 in lines:
-        px1 = to_px(p1[0], p1[1])
-        px2 = to_px(p2[0], p2[1])
-        draw.line([px1, px2], fill=(220, 235, 255), width=2)
+        img = Image.new('RGB', (IMG_SIZE, IMG_SIZE), color=(10, 15, 26))
+        draw = ImageDraw.Draw(img)
 
-    for b in inserts:
-        pos = to_px(b['x'], b['y'])
-        name = b['name']
-        if name.startswith('P80'):
-            draw.ellipse([pos[0]-6, pos[1]-6, pos[0]+6, pos[1]+6], fill=(76, 175, 80))
-            draw.text((pos[0]+8, pos[1]-7), name, fill=(76, 175, 80))
-        elif name.startswith('J1'):
-            draw.ellipse([pos[0]-5, pos[1]-5, pos[0]+5, pos[1]+5], fill=(33, 150, 243))
-            draw.text((pos[0]+8, pos[1]-7), name, fill=(33, 150, 243))
-        else:
-            draw.ellipse([pos[0]-5, pos[1]-5, pos[0]+5, pos[1]+5], fill=(0, 229, 255))
-            draw.text((pos[0]+8, pos[1]-7), name, fill=(0, 229, 255))
+        for gx in range(0, IMG_SIZE, 40):
+            draw.line([(gx, 0), (gx, IMG_SIZE)], fill=(18, 28, 45), width=1)
+        for gy in range(0, IMG_SIZE, 40):
+            draw.line([(0, gy), (IMG_SIZE, gy)], fill=(18, 28, 45), width=1)
 
-    buf = io.BytesIO()
-    img.save(buf, format='JPEG', quality=95)
-    b64_blueprint = base64.b64encode(buf.getvalue()).decode('utf-8')
+        for p1, p2 in lines:
+            px1 = to_px(p1[0], p1[1])
+            px2 = to_px(p2[0], p2[1])
+            draw.line([px1, px2], fill=(220, 235, 255), width=2)
+
+        for b in inserts:
+            pos = to_px(b['x'], b['y'])
+            name = b['name']
+            if name.startswith('P80'):
+                draw.ellipse([pos[0]-6, pos[1]-6, pos[0]+6, pos[1]+6], fill=(76, 175, 80))
+                draw.text((pos[0]+8, pos[1]-7), name, fill=(76, 175, 80))
+            elif name.startswith('J1'):
+                draw.ellipse([pos[0]-5, pos[1]-5, pos[0]+5, pos[1]+5], fill=(33, 150, 243))
+                draw.text((pos[0]+8, pos[1]-7), name, fill=(33, 150, 243))
+            else:
+                draw.ellipse([pos[0]-5, pos[1]-5, pos[0]+5, pos[1]+5], fill=(0, 229, 255))
+                draw.text((pos[0]+8, pos[1]-7), name, fill=(0, 229, 255))
+
+        buf = io.BytesIO()
+        img.save(buf, format='PNG')
+        raw_blueprint_png = buf.getvalue()
+        b64_blueprint = base64.b64encode(raw_blueprint_png).decode('utf-8')
 
     # 2. IA cataloga entidades do CAD semanticamente
     layer_info = {}
@@ -632,28 +689,31 @@ def process_cad_dxf(dxf_bytes, filename="arquivo.dxf"):
         'cad_dimensions_meters': {'width': round(cad_w, 2), 'depth': round(cad_d, 2)}
     }
 
-    system_prompt = """Você é um Engenheiro BIM e Especialista em IA para CAD/AutoCAD.
-Analise a lista completa de blocos, anotações de texto e camadas (layers) extraídas de um arquivo DXF de arquitetura.
-Catalogue e classifique inteligentemente TODAS as entidades arquitetônicas:
+    system_prompt = """Você é um Engenheiro BIM e Especialista em IA para CAD/AutoCAD e Visão Computacional.
+Analise a imagem da planta baixa em alta definição (gerada via MatplotlibBackend do ezdxf) juntamente com a lista de blocos, anotações de texto e camadas (layers) extraídas do arquivo DXF.
+Identifique e catalogue com precisão cirúrgica as entidades arquitetônicas reais:
 
-1. 'rooms': Ambientes/Cômodos (DORMI=Dormitório, ESTAR=Sala, COZINHA=Cozinha, WC=Banheiro, JANTAR=Jantar, AREA=Área de Serviço).
-2. 'doors': Portas (P80... = porta 80cm) com posição e rotação.
-3. 'windows': Janelas (J15... = 1.5m, J1... = 1.0m) com posição e rotação.
-4. 'stairs': Escadas (identifique pela camada ARQ3 com degraus horizontais ou área de circulação).
-5. 'furniture': Mobiliário e louças sanitárias identificadas a partir dos blocos (VASOSAN=sanitário, PIA=bancada_pia, GELAD=geladeira, FOGÃO4B=fogão, LAVAT=lavatório).
-6. 'openings_specs': Especificações de corte para deixar a casa oca e transitável (alturas de vergas, peitoris e vão livre de 2.10m para portas).
+1. 'wall_layers': Lista das camadas (layers) do DXF que contêm as paredes/alvenaria (atenção: em muitos projetos reais as paredes estão na layer '0', 'BLOCOS' ou similar, visualize na imagem onde as paredes pretas/brancas foram traçadas).
+2. 'stairs_layers': Lista das camadas que contêm escadas/degraus (ex: 'ARQ3').
+3. 'rooms': Ambientes/Cômodos (DORMI=Dormitório, ESTAR=Sala, COZINHA=Cozinha, WC=Banheiro, JANTAR=Jantar, AREA=Área de Serviço) com centros e dimensões estimadas.
+4. 'doors': Portas (P80... = porta 80cm) com posição [x, y], largura e rotação.
+5. 'windows': Janelas (J15... = 1.5m, J1... = 1.0m) com posição [x, y], largura e rotação.
+6. 'furniture': Mobiliário e louças sanitárias identificadas a partir dos blocos (VASOSAN=sanitário, PIA=bancada_pia, GELAD=geladeira, FOGÃO4B=fogão, LAVAT=lavatório).
+7. 'openings_specs': Especificações de corte para deixar a casa oca e transitável (alturas de vergas, peitoris e vão livre de 2.10m para portas).
 
 Retorne EXCLUSIVAMENTE um objeto JSON válido (sem markdown, sem crases):
 {
   "project_name": "Apartamento Residencial",
+  "wall_layers": ["0"],
+  "stairs_layers": ["ARQ3"],
   "rooms": [
     {"name": "Dormitório 1", "center": [x, y], "width": 3.5, "depth": 3.2, "floor_type": "madeira"}
   ],
   "doors": [
-    {"x": 3.9, "y": 4.7, "width": 0.82, "rotation": 0}
+    {"name": "P80", "x": 3.9, "y": 4.7, "width": 0.82, "rotation": 0}
   ],
   "windows": [
-    {"x": 1.9, "y": 5.4, "width": 1.50, "rotation": 90}
+    {"name": "J15", "x": 1.9, "y": 5.4, "width": 1.50, "rotation": 90}
   ],
   "stairs": [
     {"name": "Escada de Acesso", "layer": "ARQ3", "step_count": 15, "step_height": 0.17}
@@ -672,6 +732,18 @@ Retorne EXCLUSIVAMENTE um objeto JSON válido (sem markdown, sem crases):
   }
 }"""
 
+    user_msg_content = [
+        {
+            "type": "text",
+            "text": f"Analise a planta baixa em alta definição (gerada via MatplotlibBackend) e os dados brutos do DXF:\n{json.dumps(cad_summary, ensure_ascii=False)}"
+        }
+    ]
+    if b64_blueprint:
+        user_msg_content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{b64_blueprint}"}
+        })
+
     ai_data = None
     for model in [PREFERRED_MODEL, FALLBACK_MODEL]:
         try:
@@ -683,7 +755,7 @@ Retorne EXCLUSIVAMENTE um objeto JSON válido (sem markdown, sem crases):
                     'stream': False,
                     'messages': [
                         {'role': 'system', 'content': system_prompt},
-                        {'role': 'user', 'content': f'Dados do DXF:\n{json.dumps(cad_summary, ensure_ascii=False)}'}
+                        {'role': 'user', 'content': user_msg_content}
                     ],
                     'temperature': 0.1
                 },
@@ -774,17 +846,22 @@ Retorne EXCLUSIVAMENTE um objeto JSON válido (sem markdown, sem crases):
 
     all_openings = cad_doors + cad_windows
 
-    # Classificar e agrupar linhas da camada 0 (paredes) e ARQ3 (degraus de escada)
+    # Classificar e agrupar linhas das camadas identificadas semanticamente pela IA
+    ai_wall_layers = set(ai_data.get('wall_layers') or ['0'])
+    ai_stairs_layers = set(ai_data.get('stairs_layers') or ['ARQ3'])
+    if not ai_wall_layers:
+        ai_wall_layers = {'0'}
+
     h_raw = []
     v_raw = []
     stairs_lines = []
 
     for e in msp:
         if e.dxftype() == 'LINE':
-            if e.dxf.layer == 'ARQ3':
+            if e.dxf.layer in ai_stairs_layers:
                 stairs_lines.append(((round(e.dxf.start.x, 2), round(e.dxf.start.y, 2)),
                                      (round(e.dxf.end.x, 2), round(e.dxf.end.y, 2))))
-            elif e.dxf.layer == '0':
+            elif e.dxf.layer in ai_wall_layers:
                 x1, y1 = round(e.dxf.start.x, 2), round(e.dxf.start.y, 2)
                 x2, y2 = round(e.dxf.end.x, 2), round(e.dxf.end.y, 2)
                 dx, dy = x2 - x1, y2 - y1
@@ -1147,7 +1224,8 @@ Retorne EXCLUSIVAMENTE um objeto JSON válido (sem markdown, sem crases):
         "floors": floors,
         "furniture": furniture,
         "spawn_point": {"x": sp_x, "y": 1.60, "z": sp_z},
-        "image_url": f"data:image/jpeg;base64,{b64_blueprint}",
+        "_raw_blueprint_png": raw_blueprint_png,
+        "image_url": f"data:image/png;base64,{b64_blueprint}" if b64_blueprint else None,
         "ai_analysis": {
             "projeto_nome": ai_data.get("project_name", filename.replace(".dxf", "")),
             "comodos": [{"nome": r.get("name"), "tipo": r.get("floor_type")} for r in ai_data.get("rooms", [])],
@@ -1157,8 +1235,8 @@ Retorne EXCLUSIVAMENTE um objeto JSON válido (sem markdown, sem crases):
         },
         "points": [],
         "classes": [],
-        "Width": IMG_SIZE,
-        "Height": IMG_SIZE,
+        "Width": 1200,
+        "Height": 1200,
         "averageDoor": 0.8
     }
 
@@ -1201,6 +1279,26 @@ def prediction():
         data['plan_id'] = plan_id
         data['created_at'] = datetime.now().strftime('%d/%m/%Y %H:%M:%S')
         data['filename'] = filename
+
+        # Salvar blueprint HD gerado em PNG no disco para download
+        blueprint_bytes = data.pop('_raw_blueprint_png', None)
+        blueprint_filename = f"{plan_id}_blueprint.png"
+        blueprint_path = os.path.join(SAVED_PLANS_DIR, blueprint_filename)
+
+        if blueprint_bytes:
+            with open(blueprint_path, 'wb') as bf:
+                bf.write(blueprint_bytes)
+            data['blueprint_hd_url'] = f"/api/plans/{plan_id}/blueprint.png"
+            print(f"==> Planta Baixa HD salva: {blueprint_path}")
+        elif 'image_url' in data and data['image_url'] and data['image_url'].startswith('data:image'):
+            try:
+                _, encoded = data['image_url'].split(",", 1)
+                with open(blueprint_path, 'wb') as bf:
+                    bf.write(base64.b64decode(encoded))
+                data['blueprint_hd_url'] = f"/api/plans/{plan_id}/blueprint.png"
+                print(f"==> Planta Baixa HD salva a partir de b64: {blueprint_path}")
+            except Exception as _b64e:
+                print(f"Aviso ao converter b64 para arquivo de blueprint: {_b64e}")
 
         try:
             plan_path = os.path.join(SAVED_PLANS_DIR, f"{plan_id}.json")
