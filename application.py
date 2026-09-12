@@ -58,7 +58,8 @@ def normalizePoints(bbx,classNames):
 
 
 		result.append([bb[0]*normalizingY,bb[1]*normalizingX,bb[2]*normalizingY,bb[3]*normalizingX])
-	return result,(doorDifference/doorCount)
+	avg_door = (doorDifference / doorCount) if doorCount > 0 else 0.85
+	return result, avg_door
 
 
 def turnSubArraysToJson(objectsArr):
@@ -513,260 +514,33 @@ def get_latest_plan():
     return jsonify({"error": "Nenhum plano salvo encontrado"}), 404
 
 
-def parse_dxf_to_viewer_data(dxf_stream, filename="planta.dxf"):
-    content = dxf_stream.read()
-    if isinstance(content, bytes):
-        content = content.decode('utf-8', errors='ignore')
+def dxf_to_image(dxf_bytes):
+    if isinstance(dxf_bytes, bytes):
+        dxf_text = dxf_bytes.decode('utf-8', errors='ignore')
+    else:
+        dxf_text = dxf_bytes
 
-    doc = ezdxf.read(io.StringIO(content))
+    doc = ezdxf.read(io.StringIO(dxf_text))
     msp = doc.modelspace()
 
-    WALL_LAYERS = {'pared', 'wall', 'alvenaria', 'muro', 'estrutur', 'a-wall', 'divisoria'}
-    DOOR_LAYERS = {'porta', 'door', 'a-door', 'esquadria_porta'}
-    WINDOW_LAYERS = {'janela', 'window', 'a-glaz', 'vidro', 'esquadria_janela'}
-    IGNORE_LAYERS = {'cota', 'dim', 'dimension', 'medida', 'grid', 'eixo', 'hatch'}
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from ezdxf.addons.drawing import Frontend, RenderContext
+    from ezdxf.addons.drawing.matplotlib import MatplotlibBackend
 
-    raw_walls = []
-    raw_doors = []
-    raw_windows = []
-    raw_texts = []
-    all_points = []
+    fig = plt.figure(figsize=(14, 14), dpi=120)
+    ax = fig.add_axes([0, 0, 1, 1])
+    ctx = RenderContext(doc)
+    out = MatplotlibBackend(ax)
+    Frontend(ctx, out).draw_layout(msp, finalize=True)
 
-    for e in msp:
-        layer = e.dxf.layer.lower()
-        if any(ign in layer for ign in IGNORE_LAYERS):
-            continue
-
-        etype = e.dxftype()
-        if etype == 'LINE':
-            p1 = (float(e.dxf.start.x), float(e.dxf.start.y))
-            p2 = (float(e.dxf.end.x), float(e.dxf.end.y))
-            all_points.extend([p1, p2])
-
-            if any(w in layer for w in WALL_LAYERS):
-                raw_walls.append((p1, p2))
-            elif any(d in layer for d in DOOR_LAYERS):
-                raw_doors.append((p1, p2))
-            elif any(wn in layer for wn in WINDOW_LAYERS):
-                raw_windows.append((p1, p2))
-            else:
-                raw_walls.append((p1, p2))
-
-        elif etype == 'LWPOLYLINE':
-            pts = [(float(p[0]), float(p[1])) for p in e.get_points()]
-            all_points.extend(pts)
-            is_closed = e.is_closed
-            for i in range(len(pts) - 1):
-                seg = (pts[i], pts[i+1])
-                if any(w in layer for w in WALL_LAYERS):
-                    raw_walls.append(seg)
-                elif any(d in layer for d in DOOR_LAYERS):
-                    raw_doors.append(seg)
-                elif any(wn in layer for wn in WINDOW_LAYERS):
-                    raw_windows.append(seg)
-                else:
-                    raw_walls.append(seg)
-            if is_closed and len(pts) > 2:
-                seg = (pts[-1], pts[0])
-                if any(d in layer for d in DOOR_LAYERS):
-                    raw_doors.append(seg)
-                elif any(wn in layer for wn in WINDOW_LAYERS):
-                    raw_windows.append(seg)
-                else:
-                    raw_walls.append(seg)
-
-        elif etype in ('TEXT', 'MTEXT'):
-            txt = e.dxf.text if etype == 'TEXT' else e.text
-            pos = (float(e.dxf.insert.x), float(e.dxf.insert.y))
-            all_points.append(pos)
-            raw_texts.append({'name': txt.strip(), 'pos': pos})
-
-    if not all_points:
-        raise ValueError("O arquivo DXF não contém entidades geométricas 2D reconhecíveis.")
-
-    xs = [p[0] for p in all_points]
-    ys = [p[1] for p in all_points]
-    min_x, max_x = min(xs), max(xs)
-    min_y, max_y = min(ys), max(ys)
-    span_x = max(0.1, max_x - min_x)
-    span_y = max(0.1, max_y - min_y)
-
-    # Detecção automática de escala (mm, cm, m)
-    if max(span_x, span_y) > 400:
-        unit_scale = 0.001
-    elif max(span_x, span_y) > 40:
-        unit_scale = 0.01
-    else:
-        unit_scale = 1.0
-
-    center_x = (min_x + max_x) / 2.0
-    center_y = (min_y + max_y) / 2.0
-
-    lot_w_m = round(max(8.0, span_x * unit_scale + 4.0), 2)
-    lot_d_m = round(max(10.0, span_y * unit_scale + 4.0), 2)
-
-    elements_3d = []
-    points_2d = []
-    classes_2d = []
-
-    # 1. Paredes
-    for idx, (p1, p2) in enumerate(raw_walls):
-        dx = (p2[0] - p1[0]) * unit_scale
-        dy = (p2[1] - p1[1]) * unit_scale
-        length = math.hypot(dx, dy)
-        if length < 0.15:
-            continue
-
-        mid_x = ((p1[0] + p2[0]) / 2.0 - center_x) * unit_scale
-        mid_z = -((p1[1] + p2[1]) / 2.0 - center_y) * unit_scale
-
-        if abs(dx) >= abs(dy):
-            sx = round(max(0.18, length), 3)
-            sz = 0.16
-        else:
-            sx = 0.16
-            sz = round(max(0.18, length), 3)
-
-        sy = 2.80
-        py = sy / 2.0
-
-        elements_3d.append({
-            "id": f"cad_wall_{idx}",
-            "type": "wall",
-            "position": [round(mid_x, 3), round(py, 3), round(mid_z, 3)],
-            "size": [sx, sy, sz],
-            "is_exterior": False,
-            "bbox_2d": [int(min(p1[1], p2[1])), int(min(p1[0], p2[0])), int(max(p1[1], p2[1])), int(max(p1[0], p2[0]))]
-        })
-        points_2d.append({"x1": p1[0], "y1": p1[1], "x2": p2[0], "y2": p2[1]})
-        classes_2d.append({"name": "wall"})
-
-    # 2. Portas
-    for idx, (p1, p2) in enumerate(raw_doors):
-        dx = (p2[0] - p1[0]) * unit_scale
-        dy = (p2[1] - p1[1]) * unit_scale
-        length = math.hypot(dx, dy)
-        mid_x = ((p1[0] + p2[0]) / 2.0 - center_x) * unit_scale
-        mid_z = -((p1[1] + p2[1]) / 2.0 - center_y) * unit_scale
-        d_width = max(0.75, min(1.2, length if length > 0.4 else 0.85))
-
-        if abs(dx) >= abs(dy):
-            sx = round(d_width, 3)
-            sz = 0.16
-        else:
-            sx = 0.16
-            sz = round(d_width, 3)
-
-        sy = 2.10
-        py = sy / 2.0
-        elements_3d.append({
-            "id": f"cad_door_{idx}",
-            "type": "door",
-            "position": [round(mid_x, 3), round(py, 3), round(mid_z, 3)],
-            "size": [sx, sy, sz],
-            "bbox_2d": [int(min(p1[1], p2[1])), int(min(p1[0], p2[0])), int(max(p1[1], p2[1])), int(max(p1[0], p2[0]))]
-        })
-        points_2d.append({"x1": p1[0], "y1": p1[1], "x2": p2[0], "y2": p2[1]})
-        classes_2d.append({"name": "door"})
-
-    # 3. Janelas
-    for idx, (p1, p2) in enumerate(raw_windows):
-        dx = (p2[0] - p1[0]) * unit_scale
-        dy = (p2[1] - p1[1]) * unit_scale
-        length = math.hypot(dx, dy)
-        mid_x = ((p1[0] + p2[0]) / 2.0 - center_x) * unit_scale
-        mid_z = -((p1[1] + p2[1]) / 2.0 - center_y) * unit_scale
-        w_width = max(0.80, min(3.0, length if length > 0.4 else 1.20))
-
-        if abs(dx) >= abs(dy):
-            sx = round(w_width, 3)
-            sz = 0.16
-        else:
-            sx = 0.16
-            sz = round(w_width, 3)
-
-        sy = 1.20
-        py = 1.50
-        elements_3d.append({
-            "id": f"cad_win_{idx}",
-            "type": "window",
-            "position": [round(mid_x, 3), round(py, 3), round(mid_z, 3)],
-            "size": [sx, sy, sz],
-            "bbox_2d": [int(min(p1[1], p2[1])), int(min(p1[0], p2[0])), int(max(p1[1], p2[1])), int(max(p1[0], p2[0]))]
-        })
-        points_2d.append({"x1": p1[0], "y1": p1[1], "x2": p2[0], "y2": p2[1]})
-        classes_2d.append({"name": "window"})
-
-    # Pisos
-    floors = [
-        {
-            "id": "cad_floor_terreno",
-            "name": "Terreno / Gramado Base",
-            "tipo": "grama",
-            "position": [0.0, -0.01, 0.0],
-            "size": [round(lot_w_m, 3), 0.04, round(lot_d_m, 3)]
-        },
-        {
-            "id": "cad_floor_house",
-            "name": "Piso da Edificação",
-            "tipo": "porcelanato",
-            "position": [0.0, 0.03, 0.0],
-            "size": [round(span_x * unit_scale, 3), 0.06, round(span_y * unit_scale, 3)]
-        }
-    ]
-
-    # Renderização da imagem 2D para Split View
-    img_size = 1200
-    margin = 60
-    scale_px = (img_size - 2 * margin) / max(0.001, max(span_x, span_y))
-    img = Image.new('RGB', (img_size, img_size), color='#090d16')
-    draw = ImageDraw.Draw(img)
-
-    def to_px(x, y):
-        px = margin + (x - min_x) * scale_px
-        py = img_size - (margin + (y - min_y) * scale_px)
-        return (px, py)
-
-    for p1, p2 in raw_walls:
-        draw.line([to_px(p1[0], p1[1]), to_px(p2[0], p2[1])], fill='#f8fafc', width=4)
-    for p1, p2 in raw_doors:
-        draw.line([to_px(p1[0], p1[1]), to_px(p2[0], p2[1])], fill='#fb923c', width=5)
-    for p1, p2 in raw_windows:
-        draw.line([to_px(p1[0], p1[1]), to_px(p2[0], p2[1])], fill='#38bdf8', width=5)
-    for t in raw_texts:
-        draw.text(to_px(t['pos'][0], t['pos'][1]), t['name'], fill='#a855f7')
-
+    ax.axis('off')
     buf = io.BytesIO()
-    img.save(buf, format='PNG')
-    b64_img = base64.b64encode(buf.getvalue()).decode('utf-8')
-
-    room_names = [t['name'] for t in raw_texts if t['name']]
-    if not room_names:
-        room_names = ["Ambiente Principal", "Circulação"]
-
-    return {
-        "points": points_2d,
-        "classes": classes_2d,
-        "Width": img_size,
-        "Height": img_size,
-        "averageDoor": 0.85,
-        "plan_dimensions_m": {"width": lot_w_m, "depth": lot_d_m, "height": 2.80},
-        "counts": {
-            "walls": len([e for e in elements_3d if e['type'] == 'wall']),
-            "doors": len([e for e in elements_3d if e['type'] == 'door']),
-            "windows": len([e for e in elements_3d if e['type'] == 'window']),
-            "furniture": 0
-        },
-        "elements_3d": elements_3d,
-        "floors": floors,
-        "furniture": [],
-        "image_url": f"data:image/png;base64,{b64_img}",
-        "ai_analysis": {
-            "projeto_nome": f"Projeto CAD ({filename})",
-            "ambientes_detectados": room_names,
-            "origem": "CAD DXF Vetorial Direto (100% Exato - Zero Alucinação)"
-        }
-    }
+    fig.savefig(buf, format='png', bbox_inches='tight', pad_inches=0.1, facecolor='white')
+    plt.close(fig)
+    buf.seek(0)
+    return Image.open(buf)
 
 
 @application.route('/', methods=['POST'])
@@ -781,26 +555,27 @@ def prediction():
 
     try:
         if is_dxf:
-            print(f"==> Processando arquivo vetorial CAD DXF: {filename}")
-            data = parse_dxf_to_viewer_data(file_obj.stream, filename)
+            print(f"==> Renderizando CAD DXF para raster de alta resolução: {filename}")
+            imagefile = dxf_to_image(file_obj.read())
         else:
             imagefile = Image.open(file_obj.stream)
-            image, w, h = myImageLoader(imagefile)
-            print(f"==> Processando planta baixa (imagem): {w}x{h}")
 
-            bbx, class_ids, raw_ai, b64_img = detect_with_cloud_ai(imagefile, w, h)
-            temp, averageDoor = normalizePoints(bbx, class_ids)
-            temp = turnSubArraysToJson(temp)
+        image, w, h = myImageLoader(imagefile)
+        print(f"==> Processando planta baixa ({'CAD DXF' if is_dxf else 'Imagem'}): {w}x{h}")
 
-            data = {}
-            data['points'] = temp
-            data['classes'] = getClassNames(class_ids)
-            data['Width'] = w
-            data['Height'] = h
-            data['averageDoor'] = averageDoor
+        bbx, class_ids, raw_ai, b64_img = detect_with_cloud_ai(imagefile, w, h)
+        temp, averageDoor = normalizePoints(bbx, class_ids)
+        temp = turnSubArraysToJson(temp)
 
-            viewer_3d = build_3d_viewer_data(bbx, class_ids, raw_ai, w, h, b64_img)
-            data.update(viewer_3d)
+        data = {}
+        data['points'] = temp
+        data['classes'] = getClassNames(class_ids)
+        data['Width'] = w
+        data['Height'] = h
+        data['averageDoor'] = averageDoor
+
+        viewer_3d = build_3d_viewer_data(bbx, class_ids, raw_ai, w, h, b64_img)
+        data.update(viewer_3d)
 
         # Persistência do plano gerado
         plan_id = f"plan_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
