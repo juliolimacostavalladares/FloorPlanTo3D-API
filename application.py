@@ -3,7 +3,6 @@ import io
 import json
 import base64
 import requests
-import numpy
 from PIL import Image
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -15,20 +14,13 @@ cors = CORS(application, resources={r"/*": {"origins": "*"}})
 
 NINEROUTER_URL = os.environ.get("NINEROUTER_URL", "http://localhost:20128/v1/chat/completions")
 NINEROUTER_KEY = os.environ.get("NINEROUTER_KEY", "sk-4d17a0a7e062b95e-dpfpwg-9d1ccc2f")
-PREFERRED_MODEL = os.environ.get("FLOORPLAN_MODEL", "ag/claude-opus-4-6")
+PREFERRED_MODEL = os.environ.get("FLOORPLAN_MODEL", "ag/claude-opus-4-6-thinking")
 FALLBACK_MODEL = "ag/gemini-3.7-flash-high"
 
 
 def myImageLoader(imageInput):
-	image =  numpy.asarray(imageInput)
-
-
-	h,w,c=image.shape
-	if image.ndim != 3:
-		image = skimage.color.gray2rgb(image)
-		if image.shape[-1] == 4:
-			image = image[..., :3]
-	return image,w,h
+    w, h = imageInput.size
+    return imageInput, w, h
 
 def getClassNames(classIds):
 	result=list()
