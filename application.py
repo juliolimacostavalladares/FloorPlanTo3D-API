@@ -679,39 +679,78 @@ def recraft_render_room():
     strength = float(payload_data.get('strength', 0.48))
     model = payload_data.get('model', 'recraftv4_1')
 
+    camera_mode = payload_data.get('camera_mode', 'cutaway')
     room_lower = room_name.lower()
-    if 'cozinha' in room_lower or 'kitchen' in room_lower:
-        base_desc = "modern luxury kitchen with sleek custom cabinetry, quartz countertops, high-end stainless steel appliances, breakfast bar, pendant lighting"
-    elif any(k in room_lower for k in ['dormit', 'quarto', 'suite', 'bedroom']):
-        base_desc = "cozy modern master bedroom with a king-size upholstered bed, crisp white linens, wooden nightstands, warm ambient bedside lamps, elegant wooden floor"
-    elif any(k in room_lower for k in ['banheiro', 'wc', 'lavabo', 'bath']):
-        base_desc = "spa-like luxury bathroom with marble tiles, floating vanity with backlit mirror, glass shower enclosure, chrome fixtures"
-    elif any(k in room_lower for k in ['jantar', 'dining']):
-        base_desc = "sophisticated dining room with contemporary wooden dining table, comfortable upholstered chairs, statement chandelier, stylish wall art"
-    elif any(k in room_lower for k in ['varanda', 'deck', 'balcony', 'gourmet']):
-        base_desc = "gourmet outdoor terrace with teak outdoor furniture, barbecue grill station, potted olive trees, soft ambient evening lights"
-    elif any(k in room_lower for k in ['escrit', 'office', 'home']):
-        base_desc = "executive home office with designer desk, ergonomic chair, integrated wood bookshelves, desk lamp, minimalist decor"
-    elif any(k in room_lower for k in ['estar', 'sala', 'living']):
-        base_desc = "spacious contemporary living room with a plush modern sofa, textured wool rug, marble coffee table, indoor potted plants, beautiful large window with sheer curtains"
+
+    if camera_mode == 'cutaway':
+        perspective_lead = (
+            "Architectural 3D cutaway visualization, high-angle interior perspective looking down into the room. "
+            "STRICTLY PRESERVE the exact camera viewing angle, room boundary walls, architectural layout, door openings, and furniture positions of the input 3D model. "
+            "Do NOT add a ceiling or roof that blocks the view. Keep the cutaway wall presentation clean and crisp."
+        )
     else:
-        base_desc = f"photorealistic interior design of {room_name}, decorated with modern luxury furniture, stylish ambient lighting and home decor"
+        perspective_lead = (
+            "Eye-level architectural interior photography. "
+            "STRICTLY PRESERVE the room geometry, wall locations, window and door openings from the input image."
+        )
+
+    if any(k in room_lower for k in ['dormit', 'quarto', 'suite', 'bedroom', 'cama']):
+        room_desc = (
+            "This space is strictly a MASTER BEDROOM. Materialize the 3D block geometry directly into real physical objects: "
+            "the bed geometry becomes a luxurious upholstered king-size bed with soft textured white duvet, fluffy pillows, and designer headboard. "
+            "The wardrobe and closet blocks become built-in premium wood cabinetry and nightstands with warm ambient bedside lamps. "
+            "Warm natural hardwood parquet flooring, smooth plastered painted walls. "
+            "DO NOT add a living room sofa, coffee table, or television lounge furniture here — it is strictly an elegant bedroom."
+        )
+    elif 'cozinha' in room_lower or 'kitchen' in room_lower:
+        room_desc = (
+            "This space is strictly a LUXURY MODERN KITCHEN. Materialize the 3D cabinetry blocks into custom flat-panel cabinets, "
+            "honed Calacatta quartz countertops with subtle veining, undermount sink, induction cooktop, high-end stainless steel appliances, "
+            "and polished large-format porcelain tile floor. DO NOT change the room type."
+        )
+    elif any(k in room_lower for k in ['banheiro', 'wc', 'lavabo', 'bath']):
+        room_desc = (
+            "This space is strictly a LUXURY SPA BATHROOM. Materialize the 3D blocks into polished marble floor and wall tiles, "
+            "floating wooden vanity with vessel sink and backlit LED mirror, frameless glass shower enclosure, and brushed chrome fittings."
+        )
+    elif any(k in room_lower for k in ['jantar', 'dining']):
+        room_desc = (
+            "This space is strictly a CONTEMPORARY DINING ROOM. Materialize the table into a solid walnut dining table "
+            "with modern upholstered dining chairs, statement contemporary pendant chandelier, and warm oak flooring."
+        )
+    elif any(k in room_lower for k in ['varanda', 'deck', 'balcony', 'gourmet']):
+        room_desc = (
+            "This space is strictly a COVERED GOURMET BALCONY / DECK. Teak wood outdoor decking, built-in barbecue counter, "
+            "modern outdoor lounge seating, potted plants, and natural outdoor illumination."
+        )
+    elif any(k in room_lower for k in ['escrit', 'office', 'home']):
+        room_desc = (
+            "This space is strictly a CONTEMPORARY HOME OFFICE. Minimalist executive desk, ergonomic chair, built-in bookshelves, "
+            "desk lighting, and architectural presentation."
+        )
+    elif any(k in room_lower for k in ['estar', 'sala', 'living']):
+        room_desc = (
+            "This space is strictly a CONTEMPORARY LIVING ROOM. Materialize the sofa blocks into a deep plush modular sofa, "
+            "textured bouclé or wool area rug, marble coffee table, sheer floor-to-ceiling drapery, and architectural accent lighting."
+        )
+    else:
+        room_desc = f"Photorealistic interior design of this {room_name}, decorated with luxury furniture matching the 3D geometry."
 
     style_modifiers = {
-        "contemporaneo": "contemporary luxury interior design, warm natural sunlight, neutral tones, photorealistic architectural photography, archdaily style, 8k uhd",
-        "contemporary luxury": "contemporary luxury interior design, warm natural sunlight, neutral tones, photorealistic architectural photography, archdaily style, 8k uhd",
-        "escandinavo": "scandinavian minimalist interior design, light oak wood, cozy textiles, bright airy daylight, plants, hygge aesthetic, 8k uhd",
-        "scandinavian": "scandinavian minimalist interior design, light oak wood, cozy textiles, bright airy daylight, plants, hygge aesthetic, 8k uhd",
-        "industrial": "modern industrial loft interior, exposed concrete accents, black metal details, warm Edison lighting, leather furniture, 8k uhd",
-        "industrial loft": "modern industrial loft interior, exposed concrete accents, black metal details, warm Edison lighting, leather furniture, 8k uhd",
-        "minimalista": "minimalist aesthetic, clean lines, uncluttered space, hidden warm LED lights, high-end materials, architectural digest style, 8k uhd",
-        "modern minimalist": "minimalist aesthetic, clean lines, uncluttered space, hidden warm LED lights, high-end materials, architectural digest style, 8k uhd"
+        "contemporaneo": "contemporary luxury interior design, warm natural sunlight streaming in, neutral earth tones, photorealistic architectural photography, ArchDaily archviz style, 8k uhd, octane render quality",
+        "contemporary luxury": "contemporary luxury interior design, warm natural sunlight streaming in, neutral earth tones, photorealistic architectural photography, ArchDaily archviz style, 8k uhd, octane render quality",
+        "escandinavo": "scandinavian modern interior design, light white oak, cozy wool textiles, bright soft daylight, clean minimal aesthetics, 8k uhd",
+        "scandinavian": "scandinavian modern interior design, light white oak, cozy wool textiles, bright soft daylight, clean minimal aesthetics, 8k uhd",
+        "industrial": "modern industrial loft, architectural polished concrete, black matte steel accents, warm Edison pendant lights, rich leather, 8k uhd",
+        "industrial loft": "modern industrial loft, architectural polished concrete, black matte steel accents, warm Edison pendant lights, rich leather, 8k uhd",
+        "minimalista": "high-end minimalist architecture, seamless finishes, hidden cove LED lighting, premium natural materials, uncluttered tranquil space, 8k uhd",
+        "modern minimalist": "high-end minimalist architecture, seamless finishes, hidden cove LED lighting, premium natural materials, uncluttered tranquil space, 8k uhd"
     }
     style_suffix = style_modifiers.get(style, style_modifiers["contemporaneo"])
 
-    prompt = custom_prompt or f"Photorealistic 3D interior photo render of this {base_desc}, {style_suffix}"
+    prompt = custom_prompt or f"{perspective_lead} {room_desc} {style_suffix}."
     if prompt_extra:
-        prompt += f", {prompt_extra}"
+        prompt += f" Additional details: {prompt_extra}."
 
     try:
         recraft_resp = requests.post(
