@@ -34,6 +34,20 @@ NINEROUTER_KEY = os.environ.get("NINEROUTER_KEY", "sk-4d17a0a7e062b95e-dpfpwg-9d
 PREFERRED_MODEL = os.environ.get("FLOORPLAN_MODEL", "ag/gemini-3.7-flash-high")
 FALLBACK_MODEL = "ag/claude-opus-4-6-thinking"
 
+RECRAFT_API_TOKEN = os.environ.get("RECRAFT_API_TOKEN", "")
+RECRAFT_API_URL = os.environ.get("RECRAFT_API_URL", "https://external.api.recraft.ai/v1")
+
+
+def get_recraft_token(req):
+    t = (
+        req.headers.get("X-Recraft-Token") or
+        req.headers.get("Authorization", "").replace("Bearer ", "").strip()
+    )
+    if not t and req.is_json:
+        data = req.get_json(silent=True) or {}
+        t = data.get("token") or data.get("recraft_token")
+    return t or RECRAFT_API_TOKEN
+
 
 def myImageLoader(imageInput):
     w, h = imageInput.size
@@ -542,6 +556,202 @@ def download_plan_blueprint(plan_id):
                 b64 = img_url.split(',', 1)[1]
                 return send_file(io.BytesIO(base64.b64decode(b64)), mimetype='image/png', as_attachment=True, download_name=f"{plan_id}_planta_baixa_hd.png")
     return jsonify({"error": "Planta baixa não encontrada"}), 404
+
+
+@application.route('/api/plans/<plan_id>/humanized.png', methods=['GET'])
+@application.route('/api/plans/<plan_id>/humanized', methods=['GET'])
+def download_plan_humanized(plan_id):
+    png_path = os.path.join(SAVED_PLANS_DIR, f"{plan_id}_humanized.png")
+    if os.path.exists(png_path):
+        return send_file(png_path, mimetype='image/png', as_attachment=True, download_name=f"{plan_id}_planta_humanizada.png")
+    return jsonify({"error": "Planta humanizada não encontrada"}), 404
+
+
+@application.route('/api/recraft/humanize-floorplan', methods=['POST'])
+def recraft_humanize_floorplan():
+    token = get_recraft_token(request)
+    if not token:
+        return jsonify({
+            "error": "Chave de API Recraft necessária. Informe o token no cabeçalho 'X-Recraft-Token', no corpo da requisição ou configure RECRAFT_API_TOKEN no servidor."
+        }), 401
+
+    payload_data = request.get_json(silent=True) or {}
+    plan_id = payload_data.get('plan_id')
+    custom_prompt = payload_data.get('prompt', '')
+    strength = float(payload_data.get('strength', 0.45))
+    model = payload_data.get('model', 'recraftv4_1')
+
+    # Obter imagem de entrada
+    input_image_url = payload_data.get('image_url') or payload_data.get('image_data')
+    if not input_image_url and plan_id:
+        blueprint_path = os.path.join(SAVED_PLANS_DIR, f"{plan_id}_blueprint.png")
+        if os.path.exists(blueprint_path):
+            with open(blueprint_path, 'rb') as f:
+                b64 = base64.b64encode(f.read()).decode('utf-8')
+                input_image_url = f"data:image/png;base64,{b64}"
+        else:
+            json_path = os.path.join(SAVED_PLANS_DIR, f"{plan_id}.json")
+            if os.path.exists(json_path):
+                with open(json_path, 'r', encoding='utf-8') as f:
+                    pdata = json.load(f)
+                    input_image_url = pdata.get('image_url')
+
+    if not input_image_url:
+        return jsonify({"error": "Nenhuma imagem de planta fornecida ('image_url', 'image_data' ou 'plan_id' válido)"}), 400
+
+    prompt = custom_prompt or (
+        "Architectural top-down humanized floor plan render, masterplan architectural illustration, "
+        "photorealistic textures, warm natural hardwood parquet flooring in bedrooms, polished marble tiles in living room, "
+        "ceramic tile in bathrooms and kitchen, realistic modern designer furniture with beds, sofa, dining table, "
+        "soft realistic drop shadows, clear crisp walls and architectural openings, 8k resolution, archdaily presentation"
+    )
+
+    try:
+        recraft_resp = requests.post(
+            f"{RECRAFT_API_URL}/images/imageToImage",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "image_url": input_image_url,
+                "prompt": prompt,
+                "strength": strength,
+                "model": model,
+                "response_format": "url"
+            },
+            timeout=120
+        )
+
+        if recraft_resp.status_code != 200:
+            err_msg = recraft_resp.text
+            try:
+                err_data = recraft_resp.json()
+                err_msg = err_data.get('message') or err_data.get('error') or err_msg
+            except:
+                pass
+            return jsonify({"error": f"Recraft API ({recraft_resp.status_code}): {err_msg}"}), recraft_resp.status_code
+
+        res_data = recraft_resp.json()
+        generated_url = res_data.get('data', [{}])[0].get('url')
+
+        # Se houver plan_id, salva a imagem localmente
+        download_url = generated_url
+        if plan_id and generated_url:
+            try:
+                img_data = requests.get(generated_url, timeout=30).content
+                human_path = os.path.join(SAVED_PLANS_DIR, f"{plan_id}_humanized.png")
+                with open(human_path, 'wb') as f:
+                    f.write(img_data)
+                download_url = f"/api/plans/{plan_id}/humanized.png"
+            except Exception as save_err:
+                print(f"Aviso ao salvar humanized png local: {save_err}")
+
+        return jsonify({
+            "status": "success",
+            "image_url": generated_url,
+            "download_url": download_url,
+            "prompt": prompt,
+            "plan_id": plan_id
+        })
+
+    except Exception as e:
+        return jsonify({"error": f"Erro ao comunicar com Recraft: {str(e)}"}), 500
+
+
+@application.route('/api/recraft/render-room', methods=['POST'])
+def recraft_render_room():
+    token = get_recraft_token(request)
+    if not token:
+        return jsonify({
+            "error": "Chave de API Recraft necessária. Informe o token no cabeçalho 'X-Recraft-Token', no corpo da requisição ou configure RECRAFT_API_TOKEN no servidor."
+        }), 401
+
+    payload_data = request.get_json(silent=True) or {}
+    screenshot = payload_data.get('screenshot') or payload_data.get('image_url') or payload_data.get('image_data')
+    if not screenshot:
+        return jsonify({"error": "Nenhum screenshot enviado ('screenshot', 'image_url' ou 'image_data')"}), 400
+
+    room_name = payload_data.get('room_name') or payload_data.get('room_type', 'cômodo')
+    style = payload_data.get('style', 'contemporaneo')
+    custom_prompt = payload_data.get('prompt', '')
+    prompt_extra = payload_data.get('prompt_extra', '').strip()
+    strength = float(payload_data.get('strength', 0.48))
+    model = payload_data.get('model', 'recraftv4_1')
+
+    room_lower = room_name.lower()
+    if 'cozinha' in room_lower or 'kitchen' in room_lower:
+        base_desc = "modern luxury kitchen with sleek custom cabinetry, quartz countertops, high-end stainless steel appliances, breakfast bar, pendant lighting"
+    elif any(k in room_lower for k in ['dormit', 'quarto', 'suite', 'bedroom']):
+        base_desc = "cozy modern master bedroom with a king-size upholstered bed, crisp white linens, wooden nightstands, warm ambient bedside lamps, elegant wooden floor"
+    elif any(k in room_lower for k in ['banheiro', 'wc', 'lavabo', 'bath']):
+        base_desc = "spa-like luxury bathroom with marble tiles, floating vanity with backlit mirror, glass shower enclosure, chrome fixtures"
+    elif any(k in room_lower for k in ['jantar', 'dining']):
+        base_desc = "sophisticated dining room with contemporary wooden dining table, comfortable upholstered chairs, statement chandelier, stylish wall art"
+    elif any(k in room_lower for k in ['varanda', 'deck', 'balcony', 'gourmet']):
+        base_desc = "gourmet outdoor terrace with teak outdoor furniture, barbecue grill station, potted olive trees, soft ambient evening lights"
+    elif any(k in room_lower for k in ['escrit', 'office', 'home']):
+        base_desc = "executive home office with designer desk, ergonomic chair, integrated wood bookshelves, desk lamp, minimalist decor"
+    elif any(k in room_lower for k in ['estar', 'sala', 'living']):
+        base_desc = "spacious contemporary living room with a plush modern sofa, textured wool rug, marble coffee table, indoor potted plants, beautiful large window with sheer curtains"
+    else:
+        base_desc = f"photorealistic interior design of {room_name}, decorated with modern luxury furniture, stylish ambient lighting and home decor"
+
+    style_modifiers = {
+        "contemporaneo": "contemporary luxury interior design, warm natural sunlight, neutral tones, photorealistic architectural photography, archdaily style, 8k uhd",
+        "contemporary luxury": "contemporary luxury interior design, warm natural sunlight, neutral tones, photorealistic architectural photography, archdaily style, 8k uhd",
+        "escandinavo": "scandinavian minimalist interior design, light oak wood, cozy textiles, bright airy daylight, plants, hygge aesthetic, 8k uhd",
+        "scandinavian": "scandinavian minimalist interior design, light oak wood, cozy textiles, bright airy daylight, plants, hygge aesthetic, 8k uhd",
+        "industrial": "modern industrial loft interior, exposed concrete accents, black metal details, warm Edison lighting, leather furniture, 8k uhd",
+        "industrial loft": "modern industrial loft interior, exposed concrete accents, black metal details, warm Edison lighting, leather furniture, 8k uhd",
+        "minimalista": "minimalist aesthetic, clean lines, uncluttered space, hidden warm LED lights, high-end materials, architectural digest style, 8k uhd",
+        "modern minimalist": "minimalist aesthetic, clean lines, uncluttered space, hidden warm LED lights, high-end materials, architectural digest style, 8k uhd"
+    }
+    style_suffix = style_modifiers.get(style, style_modifiers["contemporaneo"])
+
+    prompt = custom_prompt or f"Photorealistic 3D interior photo render of this {base_desc}, {style_suffix}"
+    if prompt_extra:
+        prompt += f", {prompt_extra}"
+
+    try:
+        recraft_resp = requests.post(
+            f"{RECRAFT_API_URL}/images/imageToImage",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "image_url": screenshot,
+                "prompt": prompt,
+                "strength": strength,
+                "model": model,
+                "response_format": "url"
+            },
+            timeout=120
+        )
+
+        if recraft_resp.status_code != 200:
+            err_msg = recraft_resp.text
+            try:
+                err_data = recraft_resp.json()
+                err_msg = err_data.get('message') or err_data.get('error') or err_msg
+            except:
+                pass
+            return jsonify({"error": f"Recraft API ({recraft_resp.status_code}): {err_msg}"}), recraft_resp.status_code
+
+        res_data = recraft_resp.json()
+        generated_url = res_data.get('data', [{}])[0].get('url')
+
+        return jsonify({
+            "status": "success",
+            "image_url": generated_url,
+            "room_name": room_name,
+            "prompt": prompt,
+            "strength": strength
+        })
+
+    except Exception as e:
+        return jsonify({"error": f"Erro ao renderizar com Recraft: {str(e)}"}), 500
 
 
 def process_cad_dxf(dxf_bytes, filename="arquivo.dxf"):
