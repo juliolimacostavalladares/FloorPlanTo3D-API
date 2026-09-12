@@ -33,8 +33,8 @@ cors = CORS(application, resources={r"/*": {"origins": "*"}})
 
 NINEROUTER_URL = os.environ.get("NINEROUTER_URL", "http://localhost:20128/v1/chat/completions")
 NINEROUTER_KEY = os.environ.get("NINEROUTER_KEY", "sk-4d17a0a7e062b95e-dpfpwg-9d1ccc2f")
-PREFERRED_MODEL = os.environ.get("FLOORPLAN_MODEL", "ag/gemini-3.7-flash-high")
-FALLBACK_MODEL = "ag/claude-opus-4-6-thinking"
+PREFERRED_MODEL = os.environ.get("FLOORPLAN_MODEL", "cx/gpt-6-astra(ultra)")
+FALLBACK_MODEL = "cx/gpt-6-astra(ultra)"
 
 RECRAFT_API_TOKEN = os.environ.get("RECRAFT_API_TOKEN", "ZTymtxifbdhpbBBmznWWFUyPdiAtHoTYiYPSyGRI52prApomY6AbyR3osde2ZY9c")
 RECRAFT_API_URL = os.environ.get("RECRAFT_API_URL", "https://external.api.recraft.ai/v1")
@@ -905,12 +905,12 @@ def recraft_render_room():
 
 def process_cad_dxf(dxf_bytes, filename="arquivo.dxf"):
     raw_bytes = dxf_bytes if isinstance(dxf_bytes, bytes) else str(dxf_bytes).encode('latin1', errors='ignore')
-    
+
     with tempfile.NamedTemporaryFile(suffix='.dxf', delete=True) as tmp:
         tmp.write(raw_bytes)
         tmp.flush()
         doc = ezdxf.readfile(tmp.name)
-    
+
     msp = doc.modelspace()
 
     coords_x = []
