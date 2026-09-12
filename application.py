@@ -17,8 +17,8 @@ cors = CORS(application, resources={r"/*": {"origins": "*"}})
 
 NINEROUTER_URL = os.environ.get("NINEROUTER_URL", "http://localhost:20128/v1/chat/completions")
 NINEROUTER_KEY = os.environ.get("NINEROUTER_KEY", "sk-4d17a0a7e062b95e-dpfpwg-9d1ccc2f")
-PREFERRED_MODEL = os.environ.get("FLOORPLAN_MODEL", "ag/claude-opus-4-6-thinking")
-FALLBACK_MODEL = "ollama/gemma4:31b"
+PREFERRED_MODEL = os.environ.get("FLOORPLAN_MODEL", "ag/gemini-3.7-flash-high")
+FALLBACK_MODEL = "ag/claude-opus-4-6-thinking"
 
 
 def myImageLoader(imageInput):
@@ -73,43 +73,40 @@ def turnSubArraysToJson(objectsArr):
 
 
 def query_vision_ai(model_name, b64_img, w, h):
-    prompt = f"""You are a senior architectural CAD/BIM engineer.
-Analyze this COMPLETE architectural floor plan image (resolution: {w}x{h} pixels).
-CRITICAL: The floor plan includes BOTH the house and the FULL LOT / EXTERIOR AREAS (terreno, recuos, garagem, quintal, piscina).
+    prompt = f"""You are an expert architectural CAD & BIM engineer.
+Examine this architectural floor plan image (resolution: {w}x{h} pixels).
 
-Extract:
-1. 'wall': ALL wall segments as bounding boxes [y1, x1, y2, x2] in pixels.
-   - Internal room partition walls.
-   - External building envelope walls.
-   - Perimeter property boundary walls (muros de divisa do terreno, muro dos fundos, muro frontal).
-   - Ensure walls are straight, aligned, and connected to form continuous closed boundaries.
-2. 'window': window openings [y1, x1, y2, x2] in pixels.
-3. 'door': door openings [y1, x1, y2, x2] in pixels (interior doors, main entrance door, sliding patio doors).
-   - Encompass only the opening cut.
-4. 'rooms': ALL internal rooms AND external zones covering the ENTIRE property lot:
-   - Interior: 'Sala de Estar', 'Sala de Jantar', 'Cozinha', 'Suíte Master', 'Quarto 1', 'Quarto 2', 'Banheiro Social', 'Lavanderia', 'Circulação' (floor_type: 'porcelanato' | 'madeira' | 'ceramica')
-   - Exterior:
-     * 'Garagem' (floor_type: 'porcelanato' | 'concreto')
-     * 'Jardim Frontal' / 'Acesso Pedestre' (floor_type: 'grama')
-     * 'Corredor Lateral' (floor_type: 'ceramica' | 'grama')
-     * 'Quintal Fundos' / 'Área Gramada' (floor_type: 'grama')
-     * 'Deck Gourmet' / 'Área Gourmet' (floor_type: 'deck')
-     * 'Piscina' (floor_type: 'piscina')
+CRITICAL ARCHITECTURAL RULES:
+1. NEVER confuse dimension lines / cotas (thin lines with measurement numbers like 425, 300, 305, 340, 480, 290, 225, arrows, leader lines) with walls! Dimension lines are NOT walls.
+2. NEVER confuse furniture (beds, sofas, tables, cars, counters, appliances) with walls.
+3. Walls are the THICK solid double-line structural partitions enclosing the rooms and the perimeter of the house.
+4. Extract EACH ROOM with its exact pixel bounding box [ymin, xmin, ymax, xmax]:
+   - Identify all internal rooms: e.g. Quartos, Suíte, Banheiro / WC, Cozinha, Sala de Estar, Sala de Jantar, Área de Serviço, Garagem, Circulação.
+   - For each room, provide:
+     * 'name': room name in Portuguese
+     * 'bbox': [ymin, xmin, ymax, xmax] tightly enclosing the interior space of the room in pixels
+     * 'floor_type': 'porcelanato' | 'ceramica' | 'madeira' | 'concreto' | 'grama' | 'deck'
+5. Extract DOORS:
+   - 'bbox': [ymin, xmin, ymax, xmax] at the door opening
+6. Extract WINDOWS:
+   - 'bbox': [ymin, xmin, ymax, xmax] at the window opening in exterior walls
 
 Return ONLY a raw valid JSON object:
 {{
-  \"Width\": {w},
-  \"Height\": {h},
-  \"rois\": [
-    {{\"type\": \"wall\", \"bbox\": [y1, x1, y2, x2], \"is_muro\": false}},
-    {{\"type\": \"door\", \"bbox\": [y1, x1, y2, x2]}},
-    {{\"type\": \"window\", \"bbox\": [y1, x1, y2, x2]}}
+  "Width": {w},
+  "Height": {h},
+  "project_name": "Planta Baixa Residencial",
+  "rooms": [
+    {{"name": "Quarto 1", "bbox": [ymin, xmin, ymax, xmax], "floor_type": "porcelanato"}}
   ],
-  \"rooms\": [
-    {{\"name\": \"...\", \"bbox\": [y1, x1, y2, x2], \"floor_type\": \"...\"}}
+  "doors": [
+    {{"bbox": [ymin, xmin, ymax, xmax]}}
   ],
-  \"lot_width_m\": 10.0,
-  \"lot_depth_m\": 25.0
+  "windows": [
+    {{"bbox": [ymin, xmin, ymax, xmax]}}
+  ],
+  "lot_width_m": 12.0,
+  "lot_depth_m": 25.0
 }}"""
 
     payload = {
@@ -150,6 +147,53 @@ Return ONLY a raw valid JSON object:
     return json.loads(content)
 
 
+def extract_walls_from_rooms(rooms, w, h, wall_thickness=8):
+    horizontal_segments = []
+    vertical_segments = []
+
+    for r in rooms:
+        bbox = r.get("bbox", [])
+        if len(bbox) == 4:
+            y1, x1, y2, x2 = [float(v) for v in bbox]
+            ymin, ymax = min(y1, y2), max(y1, y2)
+            xmin, xmax = min(x1, x2), max(x1, x2)
+            horizontal_segments.append((ymin, xmin, xmax))
+            horizontal_segments.append((ymax, xmin, xmax))
+            vertical_segments.append((xmin, ymin, ymax))
+            vertical_segments.append((xmax, ymin, ymax))
+
+    def merge_segments(segments):
+        merged = []
+        sorted_segs = sorted(segments, key=lambda s: (s[0], s[1]))
+        tol = max(10, int(min(w, h) * 0.016))
+        for coord, start, end in sorted_segs:
+            placed = False
+            for i, (m_coord, m_start, m_end) in enumerate(merged):
+                if abs(coord - m_coord) <= tol:
+                    if not (end < m_start - tol or start > m_end + tol):
+                        merged[i] = (round((coord + m_coord) / 2.0), min(start, m_start), max(end, m_end))
+                        placed = True
+                        break
+            if not placed:
+                merged.append((coord, start, end))
+        return merged
+
+    merged_h = merge_segments(horizontal_segments)
+    merged_v = merge_segments(vertical_segments)
+
+    walls = []
+    ht = wall_thickness // 2
+    for y, x1, x2 in merged_h:
+        if (x2 - x1) < w * 0.88 and (x2 - x1) >= 15:
+            walls.append([max(0, y - ht), x1, min(h, y + ht), x2])
+
+    for x, y1, y2 in merged_v:
+        if (y2 - y1) < h * 0.88 and (y2 - y1) >= 15:
+            walls.append([y1, max(0, x - ht), y2, min(w, x + ht)])
+
+    return walls
+
+
 def detect_with_cloud_ai(imagefile, w, h):
     buffered = io.BytesIO()
     imagefile.convert("RGB").save(buffered, format="JPEG", quality=95)
@@ -163,12 +207,47 @@ def detect_with_cloud_ai(imagefile, w, h):
         print(f"Preferred model {PREFERRED_MODEL} error: {e}. Falling back to {FALLBACK_MODEL}...")
         parsed = query_vision_ai(FALLBACK_MODEL, b64_img, w, h)
 
+    rooms = parsed.get("rooms", [])
+    doors = parsed.get("doors", [])
+    windows = parsed.get("windows", [])
     rois = parsed.get("rois", [])
+
+    # Extrai paredes arquitetônicas sólidas a partir dos limites dos cômodos
+    clean_walls = []
+    if rooms and len(rooms) >= 2:
+        clean_walls = extract_walls_from_rooms(rooms, w, h)
+
+    cleaned_rois = []
+    for w_box in clean_walls:
+        cleaned_rois.append({"type": "wall", "bbox": w_box})
+
+    for d in doors:
+        bbox = d.get("bbox", [])
+        if len(bbox) == 4:
+            cleaned_rois.append({"type": "door", "bbox": bbox})
+
+    for wn in windows:
+        bbox = wn.get("bbox", [])
+        if len(bbox) == 4:
+            cleaned_rois.append({"type": "window", "bbox": bbox})
+
+    # Se não gerou pelas salas, usa rois filtrando linhas de cota que atravessam a tela
+    if not clean_walls:
+        for item in rois:
+            t = item.get("type", "wall").lower()
+            bbox = item.get("bbox", [])
+            if len(bbox) == 4:
+                y1, x1, y2, x2 = [float(v) for v in bbox]
+                if t == "wall" and (abs(x2 - x1) > w * 0.85 or abs(y2 - y1) > h * 0.85):
+                    continue
+                cleaned_rois.append(item)
+
+    parsed["rois"] = cleaned_rois
+
     bbx = []
     class_ids = []
-
     type_to_id = {"wall": 1, "window": 2, "door": 3}
-    for item in rois:
+    for item in cleaned_rois:
         t = item.get("type", "wall").lower()
         cid = type_to_id.get(t, 1)
         bbox = item.get("bbox", [])
