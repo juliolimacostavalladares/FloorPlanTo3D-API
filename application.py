@@ -1027,6 +1027,18 @@ Retorne EXCLUSIVAMENTE um objeto JSON válido (sem markdown, sem crases):
             "size": [round(rw, 3), 0.06, round(rd, 3)]
         })
 
+    # Calibrar sentido de abertura das portas para abrir estritamente para DENTRO dos cômodos
+    valid_rooms = [f for f in floors if f['id'] != 'floor_base']
+    for elem in elements_3d:
+        if elem['type'] == 'door' and valid_rooms:
+            px, py, pz = elem['position']
+            nearest = min(valid_rooms, key=lambda r: (r['position'][0] - px)**2 + (r['position'][2] - pz)**2)
+            vx = nearest['position'][0] - px
+            vz = nearest['position'][2] - pz
+            elem['open_dir_x'] = -1 if vx < 0 else 1
+            elem['open_dir_z'] = -1 if vz < 0 else 1
+            elem['target_room'] = nearest.get('name', 'Ambiente')
+
     # Mobiliário arquitetônico automático a partir dos blocos do CAD
     furniture = []
     furn_id = 0
