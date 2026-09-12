@@ -1,5 +1,6 @@
 import os
 import io
+import tempfile
 import math
 import json
 import base64
@@ -514,33 +515,289 @@ def get_latest_plan():
     return jsonify({"error": "Nenhum plano salvo encontrado"}), 404
 
 
-def dxf_to_image(dxf_bytes):
-    if isinstance(dxf_bytes, bytes):
-        dxf_text = dxf_bytes.decode('utf-8', errors='ignore')
-    else:
-        dxf_text = dxf_bytes
-
-    doc = ezdxf.read(io.StringIO(dxf_text))
+def process_cad_dxf(dxf_bytes, filename="arquivo.dxf"):
+    raw_bytes = dxf_bytes if isinstance(dxf_bytes, bytes) else str(dxf_bytes).encode('latin1', errors='ignore')
+    
+    with tempfile.NamedTemporaryFile(suffix='.dxf', delete=True) as tmp:
+        tmp.write(raw_bytes)
+        tmp.flush()
+        doc = ezdxf.readfile(tmp.name)
+    
     msp = doc.modelspace()
 
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    from ezdxf.addons.drawing import Frontend, RenderContext
-    from ezdxf.addons.drawing.matplotlib import MatplotlibBackend
+    coords_x = []
+    coords_y = []
+    lines = []
+    inserts = []
+    texts = []
 
-    fig = plt.figure(figsize=(14, 14), dpi=120)
-    ax = fig.add_axes([0, 0, 1, 1])
-    ctx = RenderContext(doc)
-    out = MatplotlibBackend(ax)
-    Frontend(ctx, out).draw_layout(msp, finalize=True)
+    for e in msp:
+        t = e.dxftype()
+        if t == 'LINE':
+            p1 = (e.dxf.start.x, e.dxf.start.y)
+            p2 = (e.dxf.end.x, e.dxf.end.y)
+            lines.append((p1, p2))
+            coords_x.extend([p1[0], p2[0]])
+            coords_y.extend([p1[1], p2[1]])
+        elif t == 'LWPOLYLINE':
+            pts = [(p[0], p[1]) for p in e.get_points('xy')]
+            for i in range(len(pts) - 1):
+                lines.append((pts[i], pts[i+1]))
+            if e.is_closed and len(pts) > 2:
+                lines.append((pts[-1], pts[0]))
+            for p in pts:
+                coords_x.append(p[0])
+                coords_y.append(p[1])
+        elif t == 'INSERT':
+            inserts.append({
+                'name': e.dxf.name,
+                'x': round(e.dxf.insert.x, 2),
+                'y': round(e.dxf.insert.y, 2),
+                'rot': round(getattr(e.dxf, 'rotation', 0), 1)
+            })
+            coords_x.append(e.dxf.insert.x)
+            coords_y.append(e.dxf.insert.y)
+        elif t in ('TEXT', 'MTEXT'):
+            text_val = getattr(e.dxf, 'text', '') or getattr(e, 'text', '')
+            texts.append({
+                'text': str(text_val),
+                'x': round(e.dxf.insert.x, 2),
+                'y': round(e.dxf.insert.y, 2)
+            })
 
-    ax.axis('off')
+    if not coords_x:
+        coords_x = [0.0, 10.0]
+    if not coords_y:
+        coords_y = [0.0, 10.0]
+
+    min_x, max_x = min(coords_x), max(coords_x)
+    min_y, max_y = min(coords_y), max(coords_y)
+    cad_w = max(1.0, max_x - min_x)
+    cad_d = max(1.0, max_y - min_y)
+    center_x = (min_x + max_x) / 2.0
+    center_y = (min_y + max_y) / 2.0
+
+    # 1. Gerar blueprint 2D vetorial de altíssima definição para o visualizador Split View
+    IMG_SIZE = 1200
+    PAD = 60
+    draw_w = IMG_SIZE - 2 * PAD
+    draw_h = IMG_SIZE - 2 * PAD
+    scale = min(draw_w / cad_w, draw_h / cad_d)
+
+    def to_px(x, y):
+        px = PAD + (x - min_x) * scale
+        py = IMG_SIZE - PAD - (y - min_y) * scale
+        return int(px), int(py)
+
+    img = Image.new('RGB', (IMG_SIZE, IMG_SIZE), color=(10, 15, 26))
+    draw = ImageDraw.Draw(img)
+
+    for gx in range(0, IMG_SIZE, 40):
+        draw.line([(gx, 0), (gx, IMG_SIZE)], fill=(18, 28, 45), width=1)
+    for gy in range(0, IMG_SIZE, 40):
+        draw.line([(0, gy), (IMG_SIZE, gy)], fill=(18, 28, 45), width=1)
+
+    for p1, p2 in lines:
+        px1 = to_px(p1[0], p1[1])
+        px2 = to_px(p2[0], p2[1])
+        draw.line([px1, px2], fill=(220, 235, 255), width=2)
+
+    for b in inserts:
+        pos = to_px(b['x'], b['y'])
+        name = b['name']
+        if name.startswith('P80'):
+            draw.ellipse([pos[0]-6, pos[1]-6, pos[0]+6, pos[1]+6], fill=(76, 175, 80))
+            draw.text((pos[0]+8, pos[1]-7), name, fill=(76, 175, 80))
+        elif name.startswith('J1'):
+            draw.ellipse([pos[0]-5, pos[1]-5, pos[0]+5, pos[1]+5], fill=(33, 150, 243))
+            draw.text((pos[0]+8, pos[1]-7), name, fill=(33, 150, 243))
+        else:
+            draw.ellipse([pos[0]-5, pos[1]-5, pos[0]+5, pos[1]+5], fill=(0, 229, 255))
+            draw.text((pos[0]+8, pos[1]-7), name, fill=(0, 229, 255))
+
     buf = io.BytesIO()
-    fig.savefig(buf, format='png', bbox_inches='tight', pad_inches=0.1, facecolor='white')
-    plt.close(fig)
-    buf.seek(0)
-    return Image.open(buf)
+    img.save(buf, format='JPEG', quality=95)
+    b64_blueprint = base64.b64encode(buf.getvalue()).decode('utf-8')
+
+    # 2. IA cataloga entidades do CAD semanticamente
+    cad_summary = {
+        'blocks': inserts,
+        'texts': texts,
+        'cad_dimensions_meters': {'width': round(cad_w, 2), 'depth': round(cad_d, 2)}
+    }
+
+    system_prompt = """Você é um arquiteto BIM e engenheiro especialista em CAD.
+Analise a lista de blocos e anotações de um arquivo AutoCAD (.dxf) de um apartamento residencial.
+Mapeie os blocos em cômodos, portas e janelas:
+- Blocos de cômodos (DORMI=Dormitório/Quarto, ESTAR=Sala de Estar, COZINHA=Cozinha, WC=Banheiro, JANTAR=Sala de Jantar, AREA=Área de Serviço).
+- Blocos de portas (P80... = porta de 0.8m).
+- Blocos de janelas (J15... = janela 1.5m, J1... = janela 1.0m).
+
+Retorne EXCLUSIVAMENTE um objeto JSON válido (sem markdown, sem crases):
+{
+  "project_name": "Apartamento Residencial",
+  "rooms": [
+    {"name": "Dormitório 1", "center": [x, y], "width": 3.5, "depth": 3.2, "floor_type": "madeira"},
+    {"name": "Sala de Estar", "center": [x, y], "width": 3.2, "depth": 3.5, "floor_type": "porcelanato"}
+  ],
+  "doors": [
+    {"x": 3.9, "y": 4.7, "width": 0.8, "rotation": 0}
+  ],
+  "windows": [
+    {"x": 1.9, "y": 5.4, "width": 1.5, "rotation": 90}
+  ]
+}"""
+
+    ai_data = None
+    for model in [PREFERRED_MODEL, FALLBACK_MODEL]:
+        try:
+            resp = requests.post(
+                NINEROUTER_URL,
+                headers={'Authorization': f'Bearer {NINEROUTER_KEY}', 'Content-Type': 'application/json'},
+                json={
+                    'model': model,
+                    'stream': False,
+                    'messages': [
+                        {'role': 'system', 'content': system_prompt},
+                        {'role': 'user', 'content': f'CAD Entities:\n{json.dumps(cad_summary, ensure_ascii=False)}'}
+                    ],
+                    'temperature': 0.1
+                },
+                timeout=60
+            )
+            if resp.status_code == 200:
+                content = resp.json()['choices'][0]['message']['content'].strip()
+                if '```' in content:
+                    content = content.split('```')[1]
+                    if content.startswith('json'):
+                        content = content[4:]
+                    content = content.strip()
+                ai_data = json.loads(content)
+                break
+        except Exception as err:
+            print(f"Erro ao consultar modelo {model}: {err}")
+
+    if not ai_data:
+        ai_data = {
+            "project_name": filename.replace(".dxf", ""),
+            "rooms": [],
+            "doors": [],
+            "windows": []
+        }
+
+    # 3. Montar elementos 3D a partir do CAD e do parsing da IA
+    elements_3d = []
+    wall_height = 2.8
+    wall_py = wall_height / 2.0
+    wall_thickness = 0.15
+
+    for idx, (p1, p2) in enumerate(lines):
+        dx = p2[0] - p1[0]
+        dy = p2[1] - p1[1]
+        length = (dx**2 + dy**2)**0.5
+        if length < 0.35:
+            continue
+
+        mid_x = (p1[0] + p2[0]) / 2.0
+        mid_y = (p1[1] + p2[1]) / 2.0
+
+        px = mid_x - center_x
+        pz = -(mid_y - center_y)
+
+        if abs(dx) >= abs(dy):
+            sx = round(length, 3)
+            sz = wall_thickness
+        else:
+            sx = wall_thickness
+            sz = round(length, 3)
+
+        elements_3d.append({
+            "id": f"wall_cad_{idx}",
+            "type": "wall",
+            "position": [round(px, 3), round(wall_py, 3), round(pz, 3)],
+            "size": [sx, round(wall_height, 3), sz],
+            "is_exterior": False
+        })
+
+    for idx, door in enumerate(ai_data.get('doors', [])):
+        dx = door.get('x', 0.0) - center_x
+        dz = -(door.get('y', 0.0) - center_y)
+        w_d = door.get('width', 0.8)
+        rot = door.get('rotation', 0)
+        is_horiz = (rot in (0, 180, 360))
+        elements_3d.append({
+            "id": f"door_{idx}",
+            "type": "door",
+            "position": [round(dx, 3), 1.05, round(dz, 3)],
+            "size": [round(w_d, 3) if is_horiz else 0.15, 2.10, 0.15 if is_horiz else round(w_d, 3)],
+            "rotation": rot
+        })
+
+    for idx, win in enumerate(ai_data.get('windows', [])):
+        wx = win.get('x', 0.0) - center_x
+        wz = -(win.get('y', 0.0) - center_y)
+        w_w = win.get('width', 1.5)
+        rot = win.get('rotation', 0)
+        is_horiz = (rot in (0, 180, 360))
+        elements_3d.append({
+            "id": f"win_{idx}",
+            "type": "window",
+            "position": [round(wx, 3), 1.5, round(wz, 3)],
+            "size": [round(w_w, 3) if is_horiz else 0.15, 1.20, 0.15 if is_horiz else round(w_w, 3)],
+            "rotation": rot
+        })
+
+    floors = []
+    floors.append({
+        "id": "floor_base",
+        "name": "Base Laje",
+        "tipo": "porcelanato",
+        "position": [0.0, -0.01, 0.0],
+        "size": [round(cad_w + 1.0, 3), 0.04, round(cad_d + 1.0, 3)]
+    })
+
+    for idx, room in enumerate(ai_data.get('rooms', [])):
+        c = room.get('center', [0, 0])
+        rx = c[0] - center_x
+        rz = -(c[1] - center_y)
+        rw = room.get('width', 3.0)
+        rd = room.get('depth', 3.0)
+        floors.append({
+            "id": f"floor_{idx}",
+            "name": room.get('name', f'Ambiente {idx+1}'),
+            "tipo": room.get('floor_type', 'porcelanato'),
+            "position": [round(rx, 3), 0.03, round(rz, 3)],
+            "size": [round(rw, 3), 0.06, round(rd, 3)]
+        })
+
+    wall_count = len([e for e in elements_3d if e["type"] == "wall"])
+    door_count = len([e for e in elements_3d if e["type"] == "door"])
+    window_count = len([e for e in elements_3d if e["type"] == "window"])
+
+    return {
+        "plan_dimensions_m": {"width": round(cad_w, 2), "depth": round(cad_d, 2), "height": 2.8},
+        "counts": {
+            "walls": wall_count,
+            "doors": door_count,
+            "windows": window_count,
+            "furniture": 0
+        },
+        "elements_3d": elements_3d,
+        "floors": floors,
+        "furniture": [],
+        "image_url": f"data:image/jpeg;base64,{b64_blueprint}",
+        "ai_analysis": {
+            "projeto_nome": ai_data.get("project_name", filename.replace(".dxf", "")),
+            "comodos": [{"nome": r.get("name"), "tipo": r.get("floor_type")} for r in ai_data.get("rooms", [])],
+            "ambientes_detectados": [r.get("name") for r in ai_data.get("rooms", [])],
+            "area_construida_m2": round(cad_w * cad_d * 0.7, 1)
+        },
+        "points": [],
+        "classes": [],
+        "Width": IMG_SIZE,
+        "Height": IMG_SIZE,
+        "averageDoor": 0.8
+    }
 
 
 @application.route('/', methods=['POST'])
@@ -555,27 +812,26 @@ def prediction():
 
     try:
         if is_dxf:
-            print(f"==> Renderizando CAD DXF para raster de alta resolução: {filename}")
-            imagefile = dxf_to_image(file_obj.read())
+            print(f"==> Processando arquivo CAD DXF via IA Semântica: {filename}")
+            data = process_cad_dxf(file_obj.read(), filename)
         else:
             imagefile = Image.open(file_obj.stream)
+            image, w, h = myImageLoader(imagefile)
+            print(f"==> Processando planta baixa (Imagem): {w}x{h}")
 
-        image, w, h = myImageLoader(imagefile)
-        print(f"==> Processando planta baixa ({'CAD DXF' if is_dxf else 'Imagem'}): {w}x{h}")
+            bbx, class_ids, raw_ai, b64_img = detect_with_cloud_ai(imagefile, w, h)
+            temp, averageDoor = normalizePoints(bbx, class_ids)
+            temp = turnSubArraysToJson(temp)
 
-        bbx, class_ids, raw_ai, b64_img = detect_with_cloud_ai(imagefile, w, h)
-        temp, averageDoor = normalizePoints(bbx, class_ids)
-        temp = turnSubArraysToJson(temp)
+            data = {}
+            data['points'] = temp
+            data['classes'] = getClassNames(class_ids)
+            data['Width'] = w
+            data['Height'] = h
+            data['averageDoor'] = averageDoor
 
-        data = {}
-        data['points'] = temp
-        data['classes'] = getClassNames(class_ids)
-        data['Width'] = w
-        data['Height'] = h
-        data['averageDoor'] = averageDoor
-
-        viewer_3d = build_3d_viewer_data(bbx, class_ids, raw_ai, w, h, b64_img)
-        data.update(viewer_3d)
+            viewer_3d = build_3d_viewer_data(bbx, class_ids, raw_ai, w, h, b64_img)
+            data.update(viewer_3d)
 
         # Persistência do plano gerado
         plan_id = f"plan_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
