@@ -34,7 +34,7 @@ NINEROUTER_KEY = os.environ.get("NINEROUTER_KEY", "sk-4d17a0a7e062b95e-dpfpwg-9d
 PREFERRED_MODEL = os.environ.get("FLOORPLAN_MODEL", "ag/gemini-3.7-flash-high")
 FALLBACK_MODEL = "ag/claude-opus-4-6-thinking"
 
-RECRAFT_API_TOKEN = os.environ.get("RECRAFT_API_TOKEN", "")
+RECRAFT_API_TOKEN = os.environ.get("RECRAFT_API_TOKEN", "ZTymtxifbdhpbBBmznWWFUyPdiAtHoTYiYPSyGRI52prApomY6AbyR3osde2ZY9c")
 RECRAFT_API_URL = os.environ.get("RECRAFT_API_URL", "https://external.api.recraft.ai/v1")
 
 
