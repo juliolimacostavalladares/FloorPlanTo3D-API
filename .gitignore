@@ -1,1 +1,7 @@
 weights/maskrcnn_15_epochs.h5
+__pycache__/
+*.pyc
+saved_plans/*.json
+saved_plans/*.png
+saved_plans/*.glb
+!saved_plans/.gitkeep
