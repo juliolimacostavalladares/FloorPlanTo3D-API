@@ -862,7 +862,9 @@ Retorne EXCLUSIVAMENTE um objeto JSON válido (sem markdown, sem crases):
                 pz = -(y - center_y)
 
                 if part['type'] == 'solid':
-                    # Parede sólida
+                    # Descartar fatias minúsculas espúrias (< 0.60m) que criam postes ou bloqueios
+                    if p_len < 0.60:
+                        continue
                     elements_3d.append({
                         'id': f'wall_h_{wall_idx}',
                         'type': 'wall',
@@ -915,6 +917,8 @@ Retorne EXCLUSIVAMENTE um objeto JSON válido (sem markdown, sem crases):
                 pz = -(p_mid - center_y)
 
                 if part['type'] == 'solid':
+                    if p_len < 0.60:
+                        continue
                     elements_3d.append({
                         'id': f'wall_v_{wall_idx}',
                         'type': 'wall',
@@ -981,7 +985,7 @@ Retorne EXCLUSIVAMENTE um objeto JSON válido (sem markdown, sem crases):
             "rotation": rot
         })
 
-    # Degraus de Escada (ARQ3) - Escada escalonada baixa, sem bloquear circulação!
+    # Degraus de Escada (ARQ3) - Nivelados no piso (altura 0.04m) para circulação 100% limpa e desobstruída
     stairs_lines.sort(key=lambda seg: (seg[0][1] + seg[1][1]) / 2.0)
     for idx, (p1, p2) in enumerate(stairs_lines):
         dx = p2[0] - p1[0]
@@ -991,13 +995,11 @@ Retorne EXCLUSIVAMENTE um objeto JSON válido (sem markdown, sem crases):
         mid_y = (p1[1] + p2[1]) / 2.0
         px = mid_x - center_x
         pz = -(mid_y - center_y)
-        step_h = round(0.12 + 0.12 * idx, 2) # Altura escalonada realista
-        step_py = round(step_h / 2.0, 2)
         elements_3d.append({
             'id': f'stair_step_{idx}',
             'type': 'wall',
-            'position': [round(px, 3), step_py, round(pz, 3)],
-            'size': [round(step_w, 3), step_h, step_d],
+            'position': [round(px, 3), 0.02, round(pz, 3)],
+            'size': [round(step_w, 3), 0.04, step_d],
             'is_exterior': False
         })
 
@@ -1121,6 +1123,17 @@ Retorne EXCLUSIVAMENTE um objeto JSON válido (sem markdown, sem crases):
             })
             furn_id += 1
 
+    # Ponto de spawn inteligente dentro da Sala de Estar para navegação em 1ª pessoa
+    living_room = next((r for r in ai_data.get('rooms', []) if 'estar' in r.get('name', '').lower() or 'sala' in r.get('name', '').lower()), None)
+    if living_room and 'center' in living_room:
+        sp_x = round(living_room['center'][0] - center_x, 3)
+        sp_z = round(-(living_room['center'][1] - center_y), 3)
+    elif ai_data.get('rooms') and 'center' in ai_data['rooms'][0]:
+        sp_x = round(ai_data['rooms'][0]['center'][0] - center_x, 3)
+        sp_z = round(-(ai_data['rooms'][0]['center'][1] - center_y), 3)
+    else:
+        sp_x, sp_z = 0.0, 0.0
+
     wall_count = len([e for e in elements_3d if e["type"] == "wall"])
     door_count = len([e for e in elements_3d if e["type"] == "door"])
     window_count = len([e for e in elements_3d if e["type"] == "window"])
@@ -1136,12 +1149,14 @@ Retorne EXCLUSIVAMENTE um objeto JSON válido (sem markdown, sem crases):
         "elements_3d": elements_3d,
         "floors": floors,
         "furniture": furniture,
+        "spawn_point": {"x": sp_x, "y": 1.60, "z": sp_z},
         "image_url": f"data:image/jpeg;base64,{b64_blueprint}",
         "ai_analysis": {
             "projeto_nome": ai_data.get("project_name", filename.replace(".dxf", "")),
             "comodos": [{"nome": r.get("name"), "tipo": r.get("floor_type")} for r in ai_data.get("rooms", [])],
             "ambientes_detectados": [r.get("name") for r in ai_data.get("rooms", [])],
-            "area_construida_m2": round(cad_w * cad_d * 0.7, 1)
+            "area_construida_m2": round(cad_w * cad_d * 0.7, 1),
+            "spawn_point": {"x": sp_x, "y": 1.60, "z": sp_z}
         },
         "points": [],
         "classes": [],
