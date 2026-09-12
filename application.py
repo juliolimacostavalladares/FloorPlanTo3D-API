@@ -567,6 +567,62 @@ def download_plan_humanized(plan_id):
     return jsonify({"error": "Planta humanizada não encontrada"}), 404
 
 
+@application.route('/api/plans/<plan_id>/bake-pbr', methods=['POST'])
+def api_bake_plan_pbr(plan_id):
+    """
+    Executa o Texture & Light Baking do modelo 3D completo da casa.
+    Calcula Ambient Occlusion por raytracing físico e parametriza UVs unificadas,
+    gerando um modelo GLB otimizado para render PBR ultra-realista.
+    """
+    json_path = os.path.join(SAVED_PLANS_DIR, f"{plan_id}.json")
+    if not os.path.exists(json_path):
+        return jsonify({"error": f"Plano {plan_id} não encontrado"}), 404
+
+    payload = request.get_json(silent=True) or {}
+    compute_ao = payload.get('compute_ao', True)
+    num_samples = int(payload.get('num_samples', 32))
+
+    output_glb = os.path.join(SAVED_PLANS_DIR, f"{plan_id}_baked.glb")
+
+    try:
+        from bake_engine import bake_house_to_glb
+        out_path, glb_size, num_verts, num_faces = bake_house_to_glb(
+            plan_json_path=json_path,
+            output_glb_path=output_glb,
+            compute_ao=compute_ao,
+            num_samples=num_samples
+        )
+        return jsonify({
+            "status": "success",
+            "plan_id": plan_id,
+            "glb_url": f"/api/plans/{plan_id}/baked.glb",
+            "size_bytes": glb_size,
+            "vertex_count": num_verts,
+            "face_count": num_faces,
+            "ao_baked": compute_ao
+        })
+    except Exception as e:
+        print(f"Erro no bake PBR do plano {plan_id}: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": f"Falha no bake PBR: {str(e)}"}), 500
+
+
+@application.route('/api/plans/<plan_id>/baked.glb', methods=['GET'])
+@application.route('/api/plans/<plan_id>/baked', methods=['GET'])
+def download_plan_baked_glb(plan_id):
+    glb_path = os.path.join(SAVED_PLANS_DIR, f"{plan_id}_baked.glb")
+    if os.path.exists(glb_path):
+        return send_file(
+            glb_path,
+            mimetype='model/gltf-binary',
+            as_attachment=False,
+            download_name=f"{plan_id}_baked.glb"
+        )
+    return jsonify({"error": "Modelo GLB assado (baked) não encontrado. Execute o bake primeiro."}), 404
+
+
+
 @application.route('/api/recraft/humanize-floorplan', methods=['POST'])
 def recraft_humanize_floorplan():
     token = get_recraft_token(request)
