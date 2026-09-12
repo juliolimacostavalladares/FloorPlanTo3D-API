@@ -620,32 +620,56 @@ def process_cad_dxf(dxf_bytes, filename="arquivo.dxf"):
     b64_blueprint = base64.b64encode(buf.getvalue()).decode('utf-8')
 
     # 2. IA cataloga entidades do CAD semanticamente
+    layer_info = {}
+    for e in msp:
+        l = e.dxf.layer
+        layer_info[l] = layer_info.get(l, 0) + 1
+
     cad_summary = {
         'blocks': inserts,
         'texts': texts,
+        'layers_entity_count': layer_info,
         'cad_dimensions_meters': {'width': round(cad_w, 2), 'depth': round(cad_d, 2)}
     }
 
-    system_prompt = """Você é um arquiteto BIM e engenheiro especialista em CAD.
-Analise a lista de blocos e anotações de um arquivo AutoCAD (.dxf) de um apartamento residencial.
-Mapeie os blocos em cômodos, portas e janelas:
-- Blocos de cômodos (DORMI=Dormitório/Quarto, ESTAR=Sala de Estar, COZINHA=Cozinha, WC=Banheiro, JANTAR=Sala de Jantar, AREA=Área de Serviço).
-- Blocos de portas (P80... = porta de 0.8m).
-- Blocos de janelas (J15... = janela 1.5m, J1... = janela 1.0m).
+    system_prompt = """Você é um Engenheiro BIM e Especialista em IA para CAD/AutoCAD.
+Analise a lista completa de blocos, anotações de texto e camadas (layers) extraídas de um arquivo DXF de arquitetura.
+Catalogue e classifique inteligentemente TODAS as entidades arquitetônicas:
+
+1. 'rooms': Ambientes/Cômodos (DORMI=Dormitório, ESTAR=Sala, COZINHA=Cozinha, WC=Banheiro, JANTAR=Jantar, AREA=Área de Serviço).
+2. 'doors': Portas (P80... = porta 80cm) com posição e rotação.
+3. 'windows': Janelas (J15... = 1.5m, J1... = 1.0m) com posição e rotação.
+4. 'stairs': Escadas (identifique pela camada ARQ3 com degraus horizontais ou área de circulação).
+5. 'furniture': Mobiliário e louças sanitárias identificadas a partir dos blocos (VASOSAN=sanitário, PIA=bancada_pia, GELAD=geladeira, FOGÃO4B=fogão, LAVAT=lavatório).
+6. 'openings_specs': Especificações de corte para deixar a casa oca e transitável (alturas de vergas, peitoris e vão livre de 2.10m para portas).
 
 Retorne EXCLUSIVAMENTE um objeto JSON válido (sem markdown, sem crases):
 {
   "project_name": "Apartamento Residencial",
   "rooms": [
-    {"name": "Dormitório 1", "center": [x, y], "width": 3.5, "depth": 3.2, "floor_type": "madeira"},
-    {"name": "Sala de Estar", "center": [x, y], "width": 3.2, "depth": 3.5, "floor_type": "porcelanato"}
+    {"name": "Dormitório 1", "center": [x, y], "width": 3.5, "depth": 3.2, "floor_type": "madeira"}
   ],
   "doors": [
-    {"x": 3.9, "y": 4.7, "width": 0.8, "rotation": 0}
+    {"x": 3.9, "y": 4.7, "width": 0.82, "rotation": 0}
   ],
   "windows": [
-    {"x": 1.9, "y": 5.4, "width": 1.5, "rotation": 90}
-  ]
+    {"x": 1.9, "y": 5.4, "width": 1.50, "rotation": 90}
+  ],
+  "stairs": [
+    {"name": "Escada de Acesso", "layer": "ARQ3", "step_count": 15, "step_height": 0.17}
+  ],
+  "furniture": [
+    {"name": "Vaso Sanitário", "tipo": "sanitario", "x": 2.1, "y": 3.5, "size": [0.45, 0.75, 0.65]},
+    {"name": "Geladeira", "tipo": "geladeira", "x": 8.4, "y": 2.2, "size": [0.75, 1.80, 0.75]}
+  ],
+  "openings_specs": {
+    "door_clear_height": 2.10,
+    "door_lintel_height": 0.70,
+    "window_sill_height": 1.00,
+    "window_lintel_height": 0.60,
+    "wall_height": 2.80,
+    "wall_thickness": 0.15
+  }
 }"""
 
     ai_data = None
@@ -659,7 +683,7 @@ Retorne EXCLUSIVAMENTE um objeto JSON válido (sem markdown, sem crases):
                     'stream': False,
                     'messages': [
                         {'role': 'system', 'content': system_prompt},
-                        {'role': 'user', 'content': f'CAD Entities:\n{json.dumps(cad_summary, ensure_ascii=False)}'}
+                        {'role': 'user', 'content': f'Dados do DXF:\n{json.dumps(cad_summary, ensure_ascii=False)}'}
                     ],
                     'temperature': 0.1
                 },
@@ -682,13 +706,28 @@ Retorne EXCLUSIVAMENTE um objeto JSON válido (sem markdown, sem crases):
             "project_name": filename.replace(".dxf", ""),
             "rooms": [],
             "doors": [],
-            "windows": []
+            "windows": [],
+            "stairs": [],
+            "furniture": [],
+            "openings_specs": {
+                "door_clear_height": 2.10,
+                "door_lintel_height": 0.70,
+                "window_sill_height": 1.00,
+                "window_lintel_height": 0.60,
+                "wall_height": 2.80,
+                "wall_thickness": 0.15
+            }
         }
 
     # 3. Montar elementos 3D com cortes arquitetônicos (BIM Openings Clipping)
-    # e consolidação de paredes para deixar o modelo oco, penetrável e usável.
-    WALL_HEIGHT = 2.80
-    WALL_THICK = 0.15
+    # usando as especificações volumétricas calculadas pela IA
+    specs = ai_data.get('openings_specs', {})
+    WALL_HEIGHT = float(specs.get('wall_height', 2.80))
+    WALL_THICK = float(specs.get('wall_thickness', 0.15))
+    DOOR_CLEAR_H = float(specs.get('door_clear_height', 2.10))
+    DOOR_LINTEL_H = float(specs.get('door_lintel_height', round(WALL_HEIGHT - DOOR_CLEAR_H, 2)))
+    WIN_SILL_H = float(specs.get('window_sill_height', 1.00))
+    WIN_LINTEL_H = float(specs.get('window_lintel_height', 0.60))
 
     # Coletar aberturas precisas do CAD
     cad_doors = []
@@ -833,9 +872,9 @@ Retorne EXCLUSIVAMENTE um objeto JSON válido (sem markdown, sem crases):
                     })
                     wall_idx += 1
                 elif part['type'] == 'door':
-                    # VÃO LIVRE DE PORTA: Chão aberto! Apenas verga superior (lintel) de 2.10m a 2.80m
-                    lintel_h = round(WALL_HEIGHT - 2.10, 3)
-                    lintel_py = round(2.10 + lintel_h / 2.0, 3)
+                    # VÃO LIVRE DE PORTA: Chão aberto! Apenas verga superior (lintel)
+                    lintel_h = round(DOOR_LINTEL_H, 3)
+                    lintel_py = round(DOOR_CLEAR_H + lintel_h / 2.0, 3)
                     elements_3d.append({
                         'id': f'door_lintel_{wall_idx}',
                         'type': 'wall',
@@ -845,19 +884,19 @@ Retorne EXCLUSIVAMENTE um objeto JSON válido (sem markdown, sem crases):
                     })
                     wall_idx += 1
                 elif part['type'] == 'window':
-                    # VÃO DE JANELA: Peitoril (0 a 1.00m) + Verga (2.20m a 2.80m)
+                    # VÃO DE JANELA: Peitoril + Verga
                     elements_3d.append({
                         'id': f'win_sill_{wall_idx}',
                         'type': 'wall',
-                        'position': [round(px, 3), 0.50, round(pz, 3)],
-                        'size': [round(p_len, 3), 1.00, WALL_THICK],
+                        'position': [round(px, 3), round(WIN_SILL_H / 2.0, 3), round(pz, 3)],
+                        'size': [round(p_len, 3), WIN_SILL_H, WALL_THICK],
                         'is_exterior': False
                     })
                     elements_3d.append({
                         'id': f'win_lintel_{wall_idx}',
                         'type': 'wall',
-                        'position': [round(px, 3), 2.50, round(pz, 3)],
-                        'size': [round(p_len, 3), 0.60, WALL_THICK],
+                        'position': [round(px, 3), round(WALL_HEIGHT - WIN_LINTEL_H / 2.0, 3), round(pz, 3)],
+                        'size': [round(p_len, 3), WIN_LINTEL_H, WALL_THICK],
                         'is_exterior': False
                     })
                     wall_idx += 1
@@ -885,8 +924,8 @@ Retorne EXCLUSIVAMENTE um objeto JSON válido (sem markdown, sem crases):
                     })
                     wall_idx += 1
                 elif part['type'] == 'door':
-                    lintel_h = round(WALL_HEIGHT - 2.10, 3)
-                    lintel_py = round(2.10 + lintel_h / 2.0, 3)
+                    lintel_h = round(DOOR_LINTEL_H, 3)
+                    lintel_py = round(DOOR_CLEAR_H + lintel_h / 2.0, 3)
                     elements_3d.append({
                         'id': f'door_lintel_{wall_idx}',
                         'type': 'wall',
@@ -899,15 +938,15 @@ Retorne EXCLUSIVAMENTE um objeto JSON válido (sem markdown, sem crases):
                     elements_3d.append({
                         'id': f'win_sill_{wall_idx}',
                         'type': 'wall',
-                        'position': [round(px, 3), 0.50, round(pz, 3)],
-                        'size': [WALL_THICK, 1.00, round(p_len, 3)],
+                        'position': [round(px, 3), round(WIN_SILL_H / 2.0, 3), round(pz, 3)],
+                        'size': [WALL_THICK, WIN_SILL_H, round(p_len, 3)],
                         'is_exterior': False
                     })
                     elements_3d.append({
                         'id': f'win_lintel_{wall_idx}',
                         'type': 'wall',
-                        'position': [round(px, 3), 2.50, round(pz, 3)],
-                        'size': [WALL_THICK, 0.60, round(p_len, 3)],
+                        'position': [round(px, 3), round(WALL_HEIGHT - WIN_LINTEL_H / 2.0, 3), round(pz, 3)],
+                        'size': [WALL_THICK, WIN_LINTEL_H, round(p_len, 3)],
                         'is_exterior': False
                     })
                     wall_idx += 1
