@@ -685,68 +685,284 @@ Retorne EXCLUSIVAMENTE um objeto JSON válido (sem markdown, sem crases):
             "windows": []
         }
 
-    # 3. Montar elementos 3D a partir do CAD e do parsing da IA
+    # 3. Montar elementos 3D com cortes arquitetônicos (BIM Openings Clipping)
+    # e consolidação de paredes para deixar o modelo oco, penetrável e usável.
+    WALL_HEIGHT = 2.80
+    WALL_THICK = 0.15
+
+    # Coletar aberturas precisas do CAD
+    cad_doors = []
+    cad_windows = []
+    for b in inserts:
+        b_name = b['name']
+        b_rot = b.get('rot', 0)
+        is_vert = (round(b_rot) in (90, 270))
+        if b_name.startswith('P80'):
+            cad_doors.append({'type': 'door', 'x': b['x'], 'y': b['y'], 'width': 0.85, 'is_vertical': is_vert, 'name': b_name, 'rot': b_rot})
+        elif b_name.startswith('J15'):
+            cad_windows.append({'type': 'window', 'x': b['x'], 'y': b['y'], 'width': 1.50, 'is_vertical': is_vert, 'name': b_name, 'rot': b_rot})
+        elif b_name.startswith('J1'):
+            cad_windows.append({'type': 'window', 'x': b['x'], 'y': b['y'], 'width': 1.00, 'is_vertical': is_vert, 'name': b_name, 'rot': b_rot})
+
+    # Se a IA tiver achado portas/janelas adicionais
+    for d in ai_data.get('doors', []):
+        if not any(abs(d.get('x', 0) - cd['x']) < 0.5 and abs(d.get('y', 0) - cd['y']) < 0.5 for cd in cad_doors):
+            rot = d.get('rotation', 0)
+            cad_doors.append({'type': 'door', 'x': d.get('x', 0), 'y': d.get('y', 0), 'width': d.get('width', 0.85), 'is_vertical': round(rot) in (90, 270), 'name': 'P80', 'rot': rot})
+
+    for w in ai_data.get('windows', []):
+        if not any(abs(w.get('x', 0) - cw['x']) < 0.5 and abs(w.get('y', 0) - cw['y']) < 0.5 for cw in cad_windows):
+            rot = w.get('rotation', 0)
+            cad_windows.append({'type': 'window', 'x': w.get('x', 0), 'y': w.get('y', 0), 'width': w.get('width', 1.50), 'is_vertical': round(rot) in (90, 270), 'name': 'J15', 'rot': rot})
+
+    all_openings = cad_doors + cad_windows
+
+    # Classificar e agrupar linhas da camada 0 (paredes) e ARQ3 (degraus de escada)
+    h_raw = []
+    v_raw = []
+    stairs_lines = []
+
+    for e in msp:
+        if e.dxftype() == 'LINE':
+            if e.dxf.layer == 'ARQ3':
+                stairs_lines.append(((round(e.dxf.start.x, 2), round(e.dxf.start.y, 2)),
+                                     (round(e.dxf.end.x, 2), round(e.dxf.end.y, 2))))
+            elif e.dxf.layer == '0':
+                x1, y1 = round(e.dxf.start.x, 2), round(e.dxf.start.y, 2)
+                x2, y2 = round(e.dxf.end.x, 2), round(e.dxf.end.y, 2)
+                dx, dy = x2 - x1, y2 - y1
+                length = (dx**2 + dy**2)**0.5
+                if length < 0.20:
+                    continue
+                if abs(dy) <= 0.05:
+                    h_raw.append((min(x1, x2), max(x1, x2), (y1 + y2) / 2.0))
+                elif abs(dx) <= 0.05:
+                    v_raw.append((min(y1, y2), max(y1, y2), (x1 + x2) / 2.0))
+
+    def merge_1d_segments(intervals):
+        if not intervals:
+            return []
+        intervals.sort(key=lambda x: x[0])
+        merged = [intervals[0]]
+        for cur in intervals[1:]:
+            prev = merged[-1]
+            if cur[0] <= prev[1] + 0.12:
+                merged[-1] = (prev[0], max(prev[1], cur[1]))
+            else:
+                merged.append(cur)
+        return merged
+
+    # Agrupar linhas horizontais paralelas (fusão de paredes duplas de 15cm)
+    h_groups = []
+    for xmin, xmax, y in h_raw:
+        matched = False
+        for grp in h_groups:
+            if abs(grp['y'] - y) <= 0.20:
+                grp['segments'].append((xmin, xmax))
+                grp['y'] = (grp['y'] * grp['count'] + y) / (grp['count'] + 1)
+                grp['count'] += 1
+                matched = True
+                break
+        if not matched:
+            h_groups.append({'y': y, 'segments': [(xmin, xmax)], 'count': 1})
+
+    # Agrupar linhas verticais paralelas (fusão de paredes duplas de 15cm)
+    v_groups = []
+    for ymin, ymax, x in v_raw:
+        matched = False
+        for grp in v_groups:
+            if abs(grp['x'] - x) <= 0.20:
+                grp['segments'].append((ymin, ymax))
+                grp['x'] = (grp['x'] * grp['count'] + x) / (grp['count'] + 1)
+                grp['count'] += 1
+                matched = True
+                break
+        if not matched:
+            v_groups.append({'x': x, 'segments': [(ymin, ymax)], 'count': 1})
+
+    def clip_wall_with_openings(w_start, w_end, w_fixed, is_horizontal, relevant_openings):
+        cuts = []
+        for op in relevant_openings:
+            op_pos = op['x'] if is_horizontal else op['y']
+            op_fixed = op['y'] if is_horizontal else op['x']
+            if abs(op_fixed - w_fixed) <= 0.35 and (w_start - 0.20 <= op_pos <= w_end + 0.20):
+                c_start = max(w_start, op_pos - op['width'] / 2.0)
+                c_end = min(w_end, op_pos + op['width'] / 2.0)
+                if c_end > c_start + 0.10:
+                    cuts.append({'start': c_start, 'end': c_end, 'type': op['type'], 'op': op})
+
+        if not cuts:
+            return [{'start': w_start, 'end': w_end, 'type': 'solid'}]
+
+        cuts.sort(key=lambda c: c['start'])
+        result = []
+        cur = w_start
+        for c in cuts:
+            if c['start'] > cur + 0.10:
+                result.append({'start': cur, 'end': c['start'], 'type': 'solid'})
+            result.append({'start': c['start'], 'end': c['end'], 'type': c['type'], 'op': c['op']})
+            cur = max(cur, c['end'])
+        if cur < w_end - 0.10:
+            result.append({'start': cur, 'end': w_end, 'type': 'solid'})
+        return result
+
     elements_3d = []
-    wall_height = 2.8
-    wall_py = wall_height / 2.0
-    wall_thickness = 0.15
+    wall_idx = 0
 
-    for idx, (p1, p2) in enumerate(lines):
-        dx = p2[0] - p1[0]
-        dy = p2[1] - p1[1]
-        length = (dx**2 + dy**2)**0.5
-        if length < 0.35:
-            continue
+    # Construir paredes horizontais com vãos de corte
+    for grp in h_groups:
+        y = grp['y']
+        for seg_start, seg_end in merge_1d_segments(grp['segments']):
+            if seg_end - seg_start < 0.35:
+                continue
+            clipped = clip_wall_with_openings(seg_start, seg_end, y, True, all_openings)
+            for part in clipped:
+                p_len = part['end'] - part['start']
+                p_mid = (part['start'] + part['end']) / 2.0
+                px = p_mid - center_x
+                pz = -(y - center_y)
 
-        mid_x = (p1[0] + p2[0]) / 2.0
-        mid_y = (p1[1] + p2[1]) / 2.0
+                if part['type'] == 'solid':
+                    # Parede sólida
+                    elements_3d.append({
+                        'id': f'wall_h_{wall_idx}',
+                        'type': 'wall',
+                        'position': [round(px, 3), round(WALL_HEIGHT / 2.0, 3), round(pz, 3)],
+                        'size': [round(p_len, 3), WALL_HEIGHT, WALL_THICK],
+                        'is_exterior': False
+                    })
+                    wall_idx += 1
+                elif part['type'] == 'door':
+                    # VÃO LIVRE DE PORTA: Chão aberto! Apenas verga superior (lintel) de 2.10m a 2.80m
+                    lintel_h = round(WALL_HEIGHT - 2.10, 3)
+                    lintel_py = round(2.10 + lintel_h / 2.0, 3)
+                    elements_3d.append({
+                        'id': f'door_lintel_{wall_idx}',
+                        'type': 'wall',
+                        'position': [round(px, 3), lintel_py, round(pz, 3)],
+                        'size': [round(p_len, 3), lintel_h, WALL_THICK],
+                        'is_exterior': False
+                    })
+                    wall_idx += 1
+                elif part['type'] == 'window':
+                    # VÃO DE JANELA: Peitoril (0 a 1.00m) + Verga (2.20m a 2.80m)
+                    elements_3d.append({
+                        'id': f'win_sill_{wall_idx}',
+                        'type': 'wall',
+                        'position': [round(px, 3), 0.50, round(pz, 3)],
+                        'size': [round(p_len, 3), 1.00, WALL_THICK],
+                        'is_exterior': False
+                    })
+                    elements_3d.append({
+                        'id': f'win_lintel_{wall_idx}',
+                        'type': 'wall',
+                        'position': [round(px, 3), 2.50, round(pz, 3)],
+                        'size': [round(p_len, 3), 0.60, WALL_THICK],
+                        'is_exterior': False
+                    })
+                    wall_idx += 1
 
-        px = mid_x - center_x
-        pz = -(mid_y - center_y)
+    # Construir paredes verticais com vãos de corte
+    for grp in v_groups:
+        x = grp['x']
+        for seg_start, seg_end in merge_1d_segments(grp['segments']):
+            if seg_end - seg_start < 0.35:
+                continue
+            clipped = clip_wall_with_openings(seg_start, seg_end, x, False, all_openings)
+            for part in clipped:
+                p_len = part['end'] - part['start']
+                p_mid = (part['start'] + part['end']) / 2.0
+                px = x - center_x
+                pz = -(p_mid - center_y)
 
-        if abs(dx) >= abs(dy):
-            sx = round(length, 3)
-            sz = wall_thickness
-        else:
-            sx = wall_thickness
-            sz = round(length, 3)
+                if part['type'] == 'solid':
+                    elements_3d.append({
+                        'id': f'wall_v_{wall_idx}',
+                        'type': 'wall',
+                        'position': [round(px, 3), round(WALL_HEIGHT / 2.0, 3), round(pz, 3)],
+                        'size': [WALL_THICK, WALL_HEIGHT, round(p_len, 3)],
+                        'is_exterior': False
+                    })
+                    wall_idx += 1
+                elif part['type'] == 'door':
+                    lintel_h = round(WALL_HEIGHT - 2.10, 3)
+                    lintel_py = round(2.10 + lintel_h / 2.0, 3)
+                    elements_3d.append({
+                        'id': f'door_lintel_{wall_idx}',
+                        'type': 'wall',
+                        'position': [round(px, 3), lintel_py, round(pz, 3)],
+                        'size': [WALL_THICK, lintel_h, round(p_len, 3)],
+                        'is_exterior': False
+                    })
+                    wall_idx += 1
+                elif part['type'] == 'window':
+                    elements_3d.append({
+                        'id': f'win_sill_{wall_idx}',
+                        'type': 'wall',
+                        'position': [round(px, 3), 0.50, round(pz, 3)],
+                        'size': [WALL_THICK, 1.00, round(p_len, 3)],
+                        'is_exterior': False
+                    })
+                    elements_3d.append({
+                        'id': f'win_lintel_{wall_idx}',
+                        'type': 'wall',
+                        'position': [round(px, 3), 2.50, round(pz, 3)],
+                        'size': [WALL_THICK, 0.60, round(p_len, 3)],
+                        'is_exterior': False
+                    })
+                    wall_idx += 1
 
-        elements_3d.append({
-            "id": f"wall_cad_{idx}",
-            "type": "wall",
-            "position": [round(px, 3), round(wall_py, 3), round(pz, 3)],
-            "size": [sx, round(wall_height, 3), sz],
-            "is_exterior": False
-        })
-
-    for idx, door in enumerate(ai_data.get('doors', [])):
-        dx = door.get('x', 0.0) - center_x
-        dz = -(door.get('y', 0.0) - center_y)
-        w_d = door.get('width', 0.8)
-        rot = door.get('rotation', 0)
-        is_horiz = (rot in (0, 180, 360))
+    # Inserir Portas Arquitetônicas (dentro dos vãos livres cortados)
+    for idx, door in enumerate(cad_doors):
+        dx = door['x'] - center_x
+        dz = -(door['y'] - center_y)
+        w_d = door.get('width', 0.85)
+        rot = door.get('rot', 0)
+        is_horiz = not door.get('is_vertical', False)
         elements_3d.append({
             "id": f"door_{idx}",
             "type": "door",
             "position": [round(dx, 3), 1.05, round(dz, 3)],
-            "size": [round(w_d, 3) if is_horiz else 0.15, 2.10, 0.15 if is_horiz else round(w_d, 3)],
+            "size": [round(w_d, 3) if is_horiz else WALL_THICK, 2.10, WALL_THICK if is_horiz else round(w_d, 3)],
             "rotation": rot
         })
 
-    for idx, win in enumerate(ai_data.get('windows', [])):
-        wx = win.get('x', 0.0) - center_x
-        wz = -(win.get('y', 0.0) - center_y)
-        w_w = win.get('width', 1.5)
-        rot = win.get('rotation', 0)
-        is_horiz = (rot in (0, 180, 360))
+    # Inserir Janelas Arquitetônicas (vidro transparente e esquadria dentro dos vãos cortados)
+    for idx, win in enumerate(cad_windows):
+        wx = win['x'] - center_x
+        wz = -(win['y'] - center_y)
+        w_w = win.get('width', 1.50)
+        rot = win.get('rot', 0)
+        is_horiz = not win.get('is_vertical', False)
         elements_3d.append({
             "id": f"win_{idx}",
             "type": "window",
-            "position": [round(wx, 3), 1.5, round(wz, 3)],
-            "size": [round(w_w, 3) if is_horiz else 0.15, 1.20, 0.15 if is_horiz else round(w_w, 3)],
+            "position": [round(wx, 3), 1.60, round(wz, 3)],
+            "size": [round(w_w, 3) if is_horiz else WALL_THICK, 1.20, WALL_THICK if is_horiz else round(w_w, 3)],
             "rotation": rot
         })
 
+    # Degraus de Escada (ARQ3) - Escada escalonada baixa, sem bloquear circulação!
+    stairs_lines.sort(key=lambda seg: (seg[0][1] + seg[1][1]) / 2.0)
+    for idx, (p1, p2) in enumerate(stairs_lines):
+        dx = p2[0] - p1[0]
+        step_w = abs(dx) or 2.20
+        step_d = 0.25
+        mid_x = (p1[0] + p2[0]) / 2.0
+        mid_y = (p1[1] + p2[1]) / 2.0
+        px = mid_x - center_x
+        pz = -(mid_y - center_y)
+        step_h = round(0.12 + 0.12 * idx, 2) # Altura escalonada realista
+        step_py = round(step_h / 2.0, 2)
+        elements_3d.append({
+            'id': f'stair_step_{idx}',
+            'type': 'wall',
+            'position': [round(px, 3), step_py, round(pz, 3)],
+            'size': [round(step_w, 3), step_h, step_d],
+            'is_exterior': False
+        })
+
+    # Pisos (Laje do terreno + acabamento de cada cômodo)
     floors = []
     floors.append({
         "id": "floor_base",
@@ -770,6 +986,102 @@ Retorne EXCLUSIVAMENTE um objeto JSON válido (sem markdown, sem crases):
             "size": [round(rw, 3), 0.06, round(rd, 3)]
         })
 
+    # Mobiliário arquitetônico automático a partir dos blocos do CAD
+    furniture = []
+    furn_id = 0
+    for b in inserts:
+        b_name = b['name']
+        bx = b['x'] - center_x
+        bz = -(b['y'] - center_y)
+
+        if b_name == 'VASOSAN':
+            furniture.append({
+                "id": f"furn_{furn_id}",
+                "name": "Vaso Sanitário",
+                "tipo": "sanitario",
+                "position": [round(bx, 3), 0.40, round(bz, 3)],
+                "size": [0.45, 0.75, 0.65],
+                "cor": 0xffffff
+            })
+            furn_id += 1
+        elif b_name == 'LAVAT':
+            furniture.append({
+                "id": f"furn_{furn_id}",
+                "name": "Lavatório",
+                "tipo": "bancada_pia",
+                "position": [round(bx, 3), 0.45, round(bz, 3)],
+                "size": [0.60, 0.85, 0.45],
+                "cor": 0x1e293b
+            })
+            furn_id += 1
+        elif b_name == 'PIA':
+            furniture.append({
+                "id": f"furn_{furn_id}",
+                "name": "Bancada Cozinha",
+                "tipo": "bancada_pia",
+                "position": [round(bx, 3), 0.45, round(bz, 3)],
+                "size": [1.40, 0.88, 0.60],
+                "cor": 0x1e293b
+            })
+            furn_id += 1
+        elif b_name == 'GELAD':
+            furniture.append({
+                "id": f"furn_{furn_id}",
+                "name": "Geladeira",
+                "tipo": "geladeira",
+                "position": [round(bx, 3), 0.90, round(bz, 3)],
+                "size": [0.75, 1.80, 0.75],
+                "cor": 0x94a3b8
+            })
+            furn_id += 1
+        elif b_name == 'FOGÃO4B':
+            furniture.append({
+                "id": f"furn_{furn_id}",
+                "name": "Fogão 4 Bocas",
+                "tipo": "balcao",
+                "position": [round(bx, 3), 0.45, round(bz, 3)],
+                "size": [0.60, 0.88, 0.60],
+                "cor": 0x0f172a
+            })
+            furn_id += 1
+
+    # Mobiliário nos cômodos identificados pela IA (Sofá na sala, Cama nos quartos)
+    for r in ai_data.get('rooms', []):
+        r_name = r.get('name', '').lower()
+        c = r.get('center', [0, 0])
+        rx = c[0] - center_x
+        rz = -(c[1] - center_y)
+        if 'dormitório' in r_name or 'quarto' in r_name:
+            furniture.append({
+                "id": f"furn_{furn_id}",
+                "name": f"Cama Casal - {r.get('name')}",
+                "tipo": "cama_casal",
+                "position": [round(rx, 3), 0.30, round(rz, 3)],
+                "size": [1.60, 0.60, 2.00],
+                "cor": 0x475569
+            })
+            furn_id += 1
+        elif 'estar' in r_name:
+            furniture.append({
+                "id": f"furn_{furn_id}",
+                "name": "Sofá Retrátil",
+                "tipo": "sofa",
+                "position": [round(rx, 3), 0.45, round(rz, 3)],
+                "size": [2.20, 0.85, 0.95],
+                "cor": 0x1e293b
+            })
+            furn_id += 1
+        elif 'jantar' in r_name:
+            furniture.append({
+                "id": f"furn_{furn_id}",
+                "name": "Mesa de Jantar",
+                "tipo": "mesa_jantar",
+                "position": [round(rx, 3), 0.40, round(rz, 3)],
+                "size": [1.60, 0.78, 0.90],
+                "cor": 0x78350f
+            })
+            furn_id += 1
+
     wall_count = len([e for e in elements_3d if e["type"] == "wall"])
     door_count = len([e for e in elements_3d if e["type"] == "door"])
     window_count = len([e for e in elements_3d if e["type"] == "window"])
@@ -780,11 +1092,11 @@ Retorne EXCLUSIVAMENTE um objeto JSON válido (sem markdown, sem crases):
             "walls": wall_count,
             "doors": door_count,
             "windows": window_count,
-            "furniture": 0
+            "furniture": len(furniture)
         },
         "elements_3d": elements_3d,
         "floors": floors,
-        "furniture": [],
+        "furniture": furniture,
         "image_url": f"data:image/jpeg;base64,{b64_blueprint}",
         "ai_analysis": {
             "projeto_nome": ai_data.get("project_name", filename.replace(".dxf", "")),
