@@ -15,7 +15,7 @@ cors = CORS(application, resources={r"/*": {"origins": "*"}})
 NINEROUTER_URL = os.environ.get("NINEROUTER_URL", "http://localhost:20128/v1/chat/completions")
 NINEROUTER_KEY = os.environ.get("NINEROUTER_KEY", "sk-4d17a0a7e062b95e-dpfpwg-9d1ccc2f")
 PREFERRED_MODEL = os.environ.get("FLOORPLAN_MODEL", "ag/claude-opus-4-6-thinking")
-FALLBACK_MODEL = "ag/gemini-3.7-flash-high"
+FALLBACK_MODEL = "ollama/gemma4:31b"
 
 
 def myImageLoader(imageInput):
@@ -70,24 +70,35 @@ def turnSubArraysToJson(objectsArr):
 
 
 def query_vision_ai(model_name, b64_img, w, h):
-    prompt = f"""You are a professional architectural CAD & BIM engineer.
-Analyze this floor plan image (resolution: {w}x{h} pixels).
+    prompt = f"""You are a senior architectural CAD/BIM engineer.
+Analyze this COMPLETE architectural floor plan image (resolution: {w}x{h} pixels).
+CRITICAL: The floor plan includes BOTH the house and the FULL LOT / EXTERIOR AREAS (terreno, recuos, garagem, quintal, piscina).
+
 Extract:
-1. 'wall': wall segments as bounding boxes [y1, x1, y2, x2] in pixel coordinates.
-   - Walls must be straight, aligned, and connected to form continuous closed boundaries.
+1. 'wall': ALL wall segments as bounding boxes [y1, x1, y2, x2] in pixels.
+   - Internal room partition walls.
+   - External building envelope walls.
+   - Perimeter property boundary walls (muros de divisa do terreno, muro dos fundos, muro frontal).
+   - Ensure walls are straight, aligned, and connected to form continuous closed boundaries.
 2. 'window': window openings [y1, x1, y2, x2] in pixels.
-3. 'door': door openings [y1, x1, y2, x2] in pixels.
-4. 'rooms': interior rooms and outdoor spaces with:
-   - 'name': room name in Portuguese (ex: 'Garagem', 'Sala de Estar', 'Cozinha', 'Suíte', 'Quarto 1', 'Banheiro', 'Deck Gourmet', 'Piscina', 'Jardim')
-   - 'bbox': [y1, x1, y2, x2]
-   - 'floor_type': one of ['porcelanato', 'madeira', 'ceramica', 'grama', 'deck', 'piscina']
+3. 'door': door openings [y1, x1, y2, x2] in pixels (interior doors, main entrance door, sliding patio doors).
+   - Encompass only the opening cut.
+4. 'rooms': ALL internal rooms AND external zones covering the ENTIRE property lot:
+   - Interior: 'Sala de Estar', 'Sala de Jantar', 'Cozinha', 'Suíte Master', 'Quarto 1', 'Quarto 2', 'Banheiro Social', 'Lavanderia', 'Circulação' (floor_type: 'porcelanato' | 'madeira' | 'ceramica')
+   - Exterior:
+     * 'Garagem' (floor_type: 'porcelanato' | 'concreto')
+     * 'Jardim Frontal' / 'Acesso Pedestre' (floor_type: 'grama')
+     * 'Corredor Lateral' (floor_type: 'ceramica' | 'grama')
+     * 'Quintal Fundos' / 'Área Gramada' (floor_type: 'grama')
+     * 'Deck Gourmet' / 'Área Gourmet' (floor_type: 'deck')
+     * 'Piscina' (floor_type: 'piscina')
 
 Return ONLY a raw valid JSON object:
 {{
   \"Width\": {w},
   \"Height\": {h},
   \"rois\": [
-    {{\"type\": \"wall\", \"bbox\": [y1, x1, y2, x2]}},
+    {{\"type\": \"wall\", \"bbox\": [y1, x1, y2, x2], \"is_muro\": false}},
     {{\"type\": \"door\", \"bbox\": [y1, x1, y2, x2]}},
     {{\"type\": \"window\", \"bbox\": [y1, x1, y2, x2]}}
   ],
@@ -162,16 +173,18 @@ def detect_with_cloud_ai(imagefile, w, h):
             bbx.append([float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])])
             class_ids.append(cid)
 
-    return bbx, class_ids, parsed
+    return bbx, class_ids, parsed, b64_img
 
 
-def build_3d_viewer_data(bbx, class_ids, parsed, w, h):
+def build_3d_viewer_data(bbx, class_ids, parsed, w, h, b64_img=""):
     lot_w_m = float(parsed.get("lot_width_m", 10.0))
     lot_d_m = float(parsed.get("lot_depth_m", 25.0))
     scale_x = lot_w_m / w
     scale_z = lot_d_m / h
 
     elements_3d = []
+    has_boundary_muro = False
+
     for idx, (bb, cid) in enumerate(zip(bbx, class_ids)):
         y1, x1, y2, x2 = bb
         cx = (x1 + x2) / 2.0
@@ -182,44 +195,124 @@ def build_3d_viewer_data(bbx, class_ids, parsed, w, h):
         px = (cx - w / 2.0) * scale_x
         pz = (cz - h / 2.0) * scale_z
 
-        if cid == 1:
-            sx = max(0.15, dx * scale_x)
-            sz = max(0.15, dz * scale_z)
-            sy = 2.8
+        if cid == 1: # Wall or perimeter muro
+            is_muro = (x1 <= w * 0.06 or x2 >= w * 0.94 or y1 <= h * 0.05 or y2 >= h * 0.95)
+            if is_muro:
+                has_boundary_muro = True
+            wall_id = f"muro_{idx}" if is_muro else f"wall_{idx}"
+            sy = 2.2 if is_muro else 2.8
             py = sy / 2.0
-            is_ext = (x1 <= w * 0.1 or x2 >= w * 0.9 or y1 <= h * 0.1 or y2 >= h * 0.9)
+
+            if dx >= dz:
+                sx = max(0.2, dx * scale_x)
+                sz = 0.16
+            else:
+                sz = max(0.2, dz * scale_z)
+                sx = 0.16
+
             elements_3d.append({
-                "id": f"wall_{idx}",
+                "id": wall_id,
                 "type": "wall",
                 "position": [round(px, 3), round(py, 3), round(pz, 3)],
                 "size": [round(sx, 3), round(sy, 3), round(sz, 3)],
-                "is_exterior": is_ext
+                "is_exterior": is_muro,
+                "bbox_2d": [int(y1), int(x1), int(y2), int(x2)]
             })
-        elif cid == 2:
-            sx = max(0.12, dx * scale_x)
-            sz = max(0.12, dz * scale_z)
+
+        elif cid == 2: # Window
+            is_horiz = (dx >= dz)
+            win_width = max(0.70, max(dx * scale_x, dz * scale_z))
+            wall_thick = 0.16
+            if is_horiz:
+                sx = win_width
+                sz = wall_thick
+            else:
+                sx = wall_thick
+                sz = win_width
             sy = 1.2
             py = 1.5
             elements_3d.append({
                 "id": f"win_{idx}",
                 "type": "window",
                 "position": [round(px, 3), round(py, 3), round(pz, 3)],
-                "size": [round(sx, 3), round(sy, 3), round(sz, 3)]
+                "size": [round(sx, 3), round(sy, 3), round(sz, 3)],
+                "bbox_2d": [int(y1), int(x1), int(y2), int(x2)]
             })
-        elif cid == 3:
-            sx = max(0.12, dx * scale_x)
-            sz = max(0.12, dz * scale_z)
-            sy = 2.1
+
+        elif cid == 3: # Door
+            # Door opening width (standard 0.80m - 0.90m) and wall thickness (0.16m)
+            is_horiz = (dx >= dz)
+            door_width = max(0.75, min(1.0, max(dx * scale_x, dz * scale_z)))
+            wall_thick = 0.16
+            if is_horiz:
+                sx = door_width
+                sz = wall_thick
+            else:
+                sx = wall_thick
+                sz = door_width
+            sy = 2.10
             py = sy / 2.0
             elements_3d.append({
                 "id": f"door_{idx}",
                 "type": "door",
                 "position": [round(px, 3), round(py, 3), round(pz, 3)],
-                "size": [round(sx, 3), round(sy, 3), round(sz, 3)]
+                "size": [round(sx, 3), round(sy, 3), round(sz, 3)],
+                "bbox_2d": [int(y1), int(x1), int(y2), int(x2)]
             })
 
+    # Add property boundary muros if not already present
+    if not has_boundary_muro:
+        muro_height = 2.2
+        muro_py = muro_height / 2.0
+        muro_thick = 0.18
+        # Muro lateral esquerdo
+        elements_3d.append({
+            "id": "muro_perim_esq",
+            "type": "wall",
+            "position": [-round(lot_w_m / 2.0, 3), round(muro_py, 3), 0.0],
+            "size": [muro_thick, muro_height, round(lot_d_m, 3)],
+            "is_exterior": True
+        })
+        # Muro lateral direito
+        elements_3d.append({
+            "id": "muro_perim_dir",
+            "type": "wall",
+            "position": [round(lot_w_m / 2.0, 3), round(muro_py, 3), 0.0],
+            "size": [muro_thick, muro_height, round(lot_d_m, 3)],
+            "is_exterior": True
+        })
+        # Muro dos fundos
+        elements_3d.append({
+            "id": "muro_perim_fundos",
+            "type": "wall",
+            "position": [0.0, round(muro_py, 3), -round(lot_d_m / 2.0, 3)],
+            "size": [round(lot_w_m, 3), muro_height, muro_thick],
+            "is_exterior": True
+        })
+        # Muro frontal com vão de entrada
+        elements_3d.append({
+            "id": "muro_perim_frente",
+            "type": "wall",
+            "position": [round(lot_w_m * 0.3, 3), round(muro_py, 3), round(lot_d_m / 2.0, 3)],
+            "size": [round(lot_w_m * 0.4, 3), muro_height, muro_thick],
+            "is_exterior": True
+        })
+
+    # Floors and exterior ground zones
     floors = []
+    # 1. Base lot ground slab (grama em todo o terreno)
+    floors.append({
+        "id": "floor_base_lote",
+        "name": "Terreno / Gramado Base",
+        "tipo": "grama",
+        "position": [0.0, -0.01, 0.0],
+        "size": [round(lot_w_m + 0.5, 3), 0.04, round(lot_d_m + 0.5, 3)]
+    })
+
     rooms = parsed.get("rooms", [])
+    has_pool = False
+    has_deck = False
+
     for idx, room in enumerate(rooms):
         r_box = room.get("bbox", [])
         if len(r_box) == 4:
@@ -230,24 +323,44 @@ def build_3d_viewer_data(bbx, class_ids, parsed, w, h):
             rdz = abs(ry2 - ry1)
             r_px = (rcx - w / 2.0) * scale_x
             r_pz = (rcz - h / 2.0) * scale_z
-            r_sx = max(0.5, rdx * scale_x)
-            r_sz = max(0.5, rdz * scale_z)
+            r_sx = max(0.6, rdx * scale_x)
+            r_sz = max(0.6, rdz * scale_z)
+            ftype = room.get("floor_type", "porcelanato")
+            if ftype == "piscina":
+                has_pool = True
+            if ftype == "deck":
+                has_deck = True
+
             floors.append({
                 "id": f"floor_{idx}",
                 "name": room.get("name", f"Ambiente {idx+1}"),
-                "tipo": room.get("floor_type", "porcelanato"),
-                "position": [round(r_px, 3), 0.025, round(r_pz, 3)],
-                "size": [round(r_sx, 3), 0.05, round(r_sz, 3)]
+                "tipo": ftype,
+                "position": [round(r_px, 3), 0.03, round(r_pz, 3)],
+                "size": [round(r_sx, 3), 0.06, round(r_sz, 3)]
             })
+
+    # Count statistics for UI
+    wall_count = len([e for e in elements_3d if e["type"] == "wall"])
+    door_count = len([e for e in elements_3d if e["type"] == "door"])
+    window_count = len([e for e in elements_3d if e["type"] == "window"])
 
     return {
         "plan_dimensions_m": {"width": lot_w_m, "depth": lot_d_m, "height": 2.8},
+        "counts": {
+            "walls": wall_count,
+            "doors": door_count,
+            "windows": window_count,
+            "furniture": 0
+        },
         "elements_3d": elements_3d,
         "floors": floors,
         "furniture": [],
+        "image_url": f"data:image/jpeg;base64,{b64_img}" if b64_img else None,
         "ai_analysis": {
-            "projeto_nome": parsed.get("project_name", "Planta Arquitetônica"),
-            "ambientes_detectados": [r.get("name") for r in rooms if r.get("name")]
+            "projeto_nome": parsed.get("project_name", "Planta Baixa Residencial Completa"),
+            "comodos": [{"nome": r.get("name"), "tipo": r.get("floor_type")} for r in rooms if r.get("name")],
+            "ambientes_detectados": [r.get("name") for r in rooms if r.get("name")],
+            "area_construida_m2": round(lot_w_m * lot_d_m * 0.55, 1)
         }
     }
 
@@ -279,7 +392,7 @@ def prediction():
         image, w, h = myImageLoader(imagefile)
         print(f"==> Processando planta baixa: {w}x{h}")
 
-        bbx, class_ids, raw_ai = detect_with_cloud_ai(imagefile, w, h)
+        bbx, class_ids, raw_ai, b64_img = detect_with_cloud_ai(imagefile, w, h)
         temp, averageDoor = normalizePoints(bbx, class_ids)
         temp = turnSubArraysToJson(temp)
 
@@ -290,7 +403,7 @@ def prediction():
         data['Height'] = h
         data['averageDoor'] = averageDoor
 
-        viewer_3d = build_3d_viewer_data(bbx, class_ids, raw_ai, w, h)
+        viewer_3d = build_3d_viewer_data(bbx, class_ids, raw_ai, w, h, b64_img)
         data.update(viewer_3d)
 
         return jsonify({
