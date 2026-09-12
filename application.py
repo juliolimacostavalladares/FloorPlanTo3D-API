@@ -729,30 +729,48 @@ Retorne EXCLUSIVAMENTE um objeto JSON válido (sem markdown, sem crases):
     WIN_SILL_H = float(specs.get('window_sill_height', 1.00))
     WIN_LINTEL_H = float(specs.get('window_lintel_height', 0.60))
 
-    # Coletar aberturas precisas do CAD
+    # Coletar aberturas precisas do CAD com centro geométrico real (levando em conta ponto de inserção e rotação)
     cad_doors = []
     cad_windows = []
     for b in inserts:
         b_name = b['name']
         b_rot = b.get('rot', 0)
+        b_rad = math.radians(b_rot)
         is_vert = (round(b_rot) in (90, 270))
-        if b_name.startswith('P80'):
-            cad_doors.append({'type': 'door', 'x': b['x'], 'y': b['y'], 'width': 0.85, 'is_vertical': is_vert, 'name': b_name, 'rot': b_rot})
-        elif b_name.startswith('J15'):
-            cad_windows.append({'type': 'window', 'x': b['x'], 'y': b['y'], 'width': 1.50, 'is_vertical': is_vert, 'name': b_name, 'rot': b_rot})
-        elif b_name.startswith('J1'):
-            cad_windows.append({'type': 'window', 'x': b['x'], 'y': b['y'], 'width': 1.00, 'is_vertical': is_vert, 'name': b_name, 'rot': b_rot})
 
-    # Se a IA tiver achado portas/janelas adicionais
-    for d in ai_data.get('doors', []):
-        if not any(abs(d.get('x', 0) - cd['x']) < 0.5 and abs(d.get('y', 0) - cd['y']) < 0.5 for cd in cad_doors):
+        if any(b_name.startswith(p) for p in ['P80', 'PORTA']):
+            length = 0.80
+            thick = 0.25 if '25' in b_name else 0.15
+            cx = b['x'] + (length / 2.0) * math.cos(b_rad) - (thick / 2.0) * math.sin(b_rad)
+            cy = b['y'] + (length / 2.0) * math.sin(b_rad) + (thick / 2.0) * math.cos(b_rad)
+            cad_doors.append({'type': 'door', 'x': cx, 'y': cy, 'width': length, 'thick': thick, 'is_vertical': is_vert, 'name': b_name, 'rot': b_rot})
+        elif any(b_name.startswith(p) for p in ['J15', 'J1', 'JANELA']):
+            length = 1.50 if '15' in b_name else 1.00
+            thick = 0.25 if '25' in b_name else 0.15
+            cx = b['x'] + (length / 2.0) * math.cos(b_rad) - (thick / 2.0) * math.sin(b_rad)
+            cy = b['y'] + (length / 2.0) * math.sin(b_rad) + (thick / 2.0) * math.cos(b_rad)
+            cad_windows.append({'type': 'window', 'x': cx, 'y': cy, 'width': length, 'thick': thick, 'is_vertical': is_vert, 'name': b_name, 'rot': b_rot})
+
+    # Se a IA tiver achado portas/janelas adicionais em arquivos DXF sem blocos
+    if not cad_doors:
+        for d in ai_data.get('doors', []):
             rot = d.get('rotation', 0)
-            cad_doors.append({'type': 'door', 'x': d.get('x', 0), 'y': d.get('y', 0), 'width': d.get('width', 0.85), 'is_vertical': round(rot) in (90, 270), 'name': 'P80', 'rot': rot})
+            cad_doors.append({'type': 'door', 'x': d.get('x', 0), 'y': d.get('y', 0), 'width': d.get('width', 0.80), 'thick': 0.15, 'is_vertical': round(rot) in (90, 270), 'name': 'P80', 'rot': rot})
+    else:
+        for d in ai_data.get('doors', []):
+            if not any(math.hypot(d.get('x', 0) - cd['x'], d.get('y', 0) - cd['y']) < 1.5 for cd in cad_doors):
+                rot = d.get('rotation', 0)
+                cad_doors.append({'type': 'door', 'x': d.get('x', 0), 'y': d.get('y', 0), 'width': d.get('width', 0.80), 'thick': 0.15, 'is_vertical': round(rot) in (90, 270), 'name': 'P80', 'rot': rot})
 
-    for w in ai_data.get('windows', []):
-        if not any(abs(w.get('x', 0) - cw['x']) < 0.5 and abs(w.get('y', 0) - cw['y']) < 0.5 for cw in cad_windows):
+    if not cad_windows:
+        for w in ai_data.get('windows', []):
             rot = w.get('rotation', 0)
-            cad_windows.append({'type': 'window', 'x': w.get('x', 0), 'y': w.get('y', 0), 'width': w.get('width', 1.50), 'is_vertical': round(rot) in (90, 270), 'name': 'J15', 'rot': rot})
+            cad_windows.append({'type': 'window', 'x': w.get('x', 0), 'y': w.get('y', 0), 'width': w.get('width', 1.50), 'thick': 0.15, 'is_vertical': round(rot) in (90, 270), 'name': 'J15', 'rot': rot})
+    else:
+        for w in ai_data.get('windows', []):
+            if not any(math.hypot(w.get('x', 0) - cw['x'], w.get('y', 0) - cw['y']) < 1.5 for cw in cad_windows):
+                rot = w.get('rotation', 0)
+                cad_windows.append({'type': 'window', 'x': w.get('x', 0), 'y': w.get('y', 0), 'width': w.get('width', 1.50), 'thick': 0.15, 'is_vertical': round(rot) in (90, 270), 'name': 'J15', 'rot': rot})
 
     all_openings = cad_doors + cad_windows
 
@@ -778,57 +796,48 @@ Retorne EXCLUSIVAMENTE um objeto JSON válido (sem markdown, sem crases):
                 elif abs(dx) <= 0.05:
                     v_raw.append((min(y1, y2), max(y1, y2), (x1 + x2) / 2.0))
 
-    def merge_1d_segments(intervals):
+    def merge_1d_segments(intervals, gap=0.35):
         if not intervals:
             return []
         intervals.sort(key=lambda x: x[0])
         merged = [intervals[0]]
         for cur in intervals[1:]:
             prev = merged[-1]
-            if cur[0] <= prev[1] + 0.12:
+            if cur[0] <= prev[1] + gap:
                 merged[-1] = (prev[0], max(prev[1], cur[1]))
             else:
                 merged.append(cur)
         return merged
 
-    # Agrupar linhas horizontais paralelas (fusão de paredes duplas de 15cm)
-    h_groups = []
-    for xmin, xmax, y in h_raw:
-        matched = False
-        for grp in h_groups:
-            if abs(grp['y'] - y) <= 0.20:
-                grp['segments'].append((xmin, xmax))
-                grp['y'] = (grp['y'] * grp['count'] + y) / (grp['count'] + 1)
-                grp['count'] += 1
-                matched = True
-                break
-        if not matched:
-            h_groups.append({'y': y, 'segments': [(xmin, xmax)], 'count': 1})
+    # Agrupar linhas paralelas com tolerância de 0.28m (fundindo paredes de 15cm e 25cm para eliminar paredes duplicadas)
+    def group_parallel_walls(raw_lines, threshold=0.28):
+        groups = []
+        for s_min, s_max, fixed in sorted(raw_lines, key=lambda l: l[2]):
+            matched = False
+            for grp in groups:
+                if abs(grp['fixed'] - fixed) <= threshold:
+                    grp['segments'].append((s_min, s_max))
+                    grp['all_fixed'].append(fixed)
+                    grp['fixed'] = sum(grp['all_fixed']) / len(grp['all_fixed'])
+                    matched = True
+                    break
+            if not matched:
+                groups.append({'fixed': fixed, 'all_fixed': [fixed], 'segments': [(s_min, s_max)]})
+        return groups
 
-    # Agrupar linhas verticais paralelas (fusão de paredes duplas de 15cm)
-    v_groups = []
-    for ymin, ymax, x in v_raw:
-        matched = False
-        for grp in v_groups:
-            if abs(grp['x'] - x) <= 0.20:
-                grp['segments'].append((ymin, ymax))
-                grp['x'] = (grp['x'] * grp['count'] + x) / (grp['count'] + 1)
-                grp['count'] += 1
-                matched = True
-                break
-        if not matched:
-            v_groups.append({'x': x, 'segments': [(ymin, ymax)], 'count': 1})
+    h_groups = group_parallel_walls(h_raw, 0.28)
+    v_groups = group_parallel_walls(v_raw, 0.28)
 
     def clip_wall_with_openings(w_start, w_end, w_fixed, is_horizontal, relevant_openings):
         cuts = []
         for op in relevant_openings:
             op_pos = op['x'] if is_horizontal else op['y']
             op_fixed = op['y'] if is_horizontal else op['x']
-            if abs(op_fixed - w_fixed) <= 0.35 and (w_start - 0.20 <= op_pos <= w_end + 0.20):
+            if abs(op_fixed - w_fixed) <= 0.35 and (w_start - 0.25 <= op_pos <= w_end + 0.25):
                 c_start = max(w_start, op_pos - op['width'] / 2.0)
                 c_end = min(w_end, op_pos + op['width'] / 2.0)
-                if c_end > c_start + 0.10:
-                    cuts.append({'start': c_start, 'end': c_end, 'type': op['type'], 'op': op})
+                if c_end > c_start + 0.08:
+                    cuts.append({'start': c_start, 'end': c_end, 'type': op['type']})
 
         if not cuts:
             return [{'start': w_start, 'end': w_end, 'type': 'solid'}]
@@ -839,7 +848,7 @@ Retorne EXCLUSIVAMENTE um objeto JSON válido (sem markdown, sem crases):
         for c in cuts:
             if c['start'] > cur + 0.10:
                 result.append({'start': cur, 'end': c['start'], 'type': 'solid'})
-            result.append({'start': c['start'], 'end': c['end'], 'type': c['type'], 'op': c['op']})
+            result.append({'start': c['start'], 'end': c['end'], 'type': c['type']})
             cur = max(cur, c['end'])
         if cur < w_end - 0.10:
             result.append({'start': cur, 'end': w_end, 'type': 'solid'})
@@ -848,23 +857,21 @@ Retorne EXCLUSIVAMENTE um objeto JSON válido (sem markdown, sem crases):
     elements_3d = []
     wall_idx = 0
 
-    # Construir paredes horizontais com vãos de corte
+    # Construir paredes sólidas horizontais com recortes de aberturas
     for grp in h_groups:
-        y = grp['y']
+        y = grp['fixed']
         for seg_start, seg_end in merge_1d_segments(grp['segments']):
             if seg_end - seg_start < 0.35:
                 continue
             clipped = clip_wall_with_openings(seg_start, seg_end, y, True, all_openings)
             for part in clipped:
-                p_len = part['end'] - part['start']
-                p_mid = (part['start'] + part['end']) / 2.0
-                px = p_mid - center_x
-                pz = -(y - center_y)
-
                 if part['type'] == 'solid':
-                    # Descartar fatias minúsculas espúrias (< 0.60m) que criam postes ou bloqueios
-                    if p_len < 0.60:
+                    p_len = part['end'] - part['start']
+                    if p_len < 0.35:
                         continue
+                    p_mid = (part['start'] + part['end']) / 2.0
+                    px = p_mid - center_x
+                    pz = -(y - center_y)
                     elements_3d.append({
                         'id': f'wall_h_{wall_idx}',
                         'type': 'wall',
@@ -873,52 +880,22 @@ Retorne EXCLUSIVAMENTE um objeto JSON válido (sem markdown, sem crases):
                         'is_exterior': False
                     })
                     wall_idx += 1
-                elif part['type'] == 'door':
-                    # VÃO LIVRE DE PORTA: Chão aberto! Apenas verga superior (lintel)
-                    lintel_h = round(DOOR_LINTEL_H, 3)
-                    lintel_py = round(DOOR_CLEAR_H + lintel_h / 2.0, 3)
-                    elements_3d.append({
-                        'id': f'door_lintel_{wall_idx}',
-                        'type': 'wall',
-                        'position': [round(px, 3), lintel_py, round(pz, 3)],
-                        'size': [round(p_len, 3), lintel_h, WALL_THICK],
-                        'is_exterior': False
-                    })
-                    wall_idx += 1
-                elif part['type'] == 'window':
-                    # VÃO DE JANELA: Peitoril + Verga
-                    elements_3d.append({
-                        'id': f'win_sill_{wall_idx}',
-                        'type': 'wall',
-                        'position': [round(px, 3), round(WIN_SILL_H / 2.0, 3), round(pz, 3)],
-                        'size': [round(p_len, 3), WIN_SILL_H, WALL_THICK],
-                        'is_exterior': False
-                    })
-                    elements_3d.append({
-                        'id': f'win_lintel_{wall_idx}',
-                        'type': 'wall',
-                        'position': [round(px, 3), round(WALL_HEIGHT - WIN_LINTEL_H / 2.0, 3), round(pz, 3)],
-                        'size': [round(p_len, 3), WIN_LINTEL_H, WALL_THICK],
-                        'is_exterior': False
-                    })
-                    wall_idx += 1
 
-    # Construir paredes verticais com vãos de corte
+    # Construir paredes sólidas verticais com recortes de aberturas
     for grp in v_groups:
-        x = grp['x']
+        x = grp['fixed']
         for seg_start, seg_end in merge_1d_segments(grp['segments']):
             if seg_end - seg_start < 0.35:
                 continue
             clipped = clip_wall_with_openings(seg_start, seg_end, x, False, all_openings)
             for part in clipped:
-                p_len = part['end'] - part['start']
-                p_mid = (part['start'] + part['end']) / 2.0
-                px = x - center_x
-                pz = -(p_mid - center_y)
-
                 if part['type'] == 'solid':
-                    if p_len < 0.60:
+                    p_len = part['end'] - part['start']
+                    if p_len < 0.35:
                         continue
+                    p_mid = (part['start'] + part['end']) / 2.0
+                    px = x - center_x
+                    pz = -(p_mid - center_y)
                     elements_3d.append({
                         'id': f'wall_v_{wall_idx}',
                         'type': 'wall',
@@ -927,62 +904,66 @@ Retorne EXCLUSIVAMENTE um objeto JSON válido (sem markdown, sem crases):
                         'is_exterior': False
                     })
                     wall_idx += 1
-                elif part['type'] == 'door':
-                    lintel_h = round(DOOR_LINTEL_H, 3)
-                    lintel_py = round(DOOR_CLEAR_H + lintel_h / 2.0, 3)
-                    elements_3d.append({
-                        'id': f'door_lintel_{wall_idx}',
-                        'type': 'wall',
-                        'position': [round(px, 3), lintel_py, round(pz, 3)],
-                        'size': [WALL_THICK, lintel_h, round(p_len, 3)],
-                        'is_exterior': False
-                    })
-                    wall_idx += 1
-                elif part['type'] == 'window':
-                    elements_3d.append({
-                        'id': f'win_sill_{wall_idx}',
-                        'type': 'wall',
-                        'position': [round(px, 3), round(WIN_SILL_H / 2.0, 3), round(pz, 3)],
-                        'size': [WALL_THICK, WIN_SILL_H, round(p_len, 3)],
-                        'is_exterior': False
-                    })
-                    elements_3d.append({
-                        'id': f'win_lintel_{wall_idx}',
-                        'type': 'wall',
-                        'position': [round(px, 3), round(WALL_HEIGHT - WIN_LINTEL_H / 2.0, 3), round(pz, 3)],
-                        'size': [WALL_THICK, WIN_LINTEL_H, round(p_len, 3)],
-                        'is_exterior': False
-                    })
-                    wall_idx += 1
 
-    # Inserir Portas Arquitetônicas (dentro dos vãos livres cortados)
+    # Inserir Portas Arquitetônicas (dentro dos vãos livres cortados) com Verga Superior
     for idx, door in enumerate(cad_doors):
         dx = door['x'] - center_x
         dz = -(door['y'] - center_y)
-        w_d = door.get('width', 0.85)
+        w_d = door.get('width', 0.80)
+        d_thick = door.get('thick', WALL_THICK)
         rot = door.get('rot', 0)
         is_horiz = not door.get('is_vertical', False)
+        # 1. Objeto da porta 3D
         elements_3d.append({
             "id": f"door_{idx}",
             "type": "door",
             "position": [round(dx, 3), 1.05, round(dz, 3)],
-            "size": [round(w_d, 3) if is_horiz else WALL_THICK, 2.10, WALL_THICK if is_horiz else round(w_d, 3)],
+            "size": [round(w_d, 3) if is_horiz else d_thick, 2.10, d_thick if is_horiz else round(w_d, 3)],
             "rotation": rot
         })
+        # 2. Verga superior (lintel) fechando a alvenaria acima da porta
+        lintel_h = round(DOOR_LINTEL_H, 3)
+        lintel_py = round(DOOR_CLEAR_H + lintel_h / 2.0, 3)
+        elements_3d.append({
+            "id": f"door_lintel_{idx}",
+            "type": "wall",
+            "position": [round(dx, 3), lintel_py, round(dz, 3)],
+            "size": [round(w_d, 3) if is_horiz else d_thick, lintel_h, d_thick if is_horiz else round(w_d, 3)],
+            "is_exterior": False
+        })
 
-    # Inserir Janelas Arquitetônicas (vidro transparente e esquadria dentro dos vãos cortados)
+    # Inserir Janelas Arquitetônicas completas (Peitoril + Janela + Verga fechando 100% da fachada)
     for idx, win in enumerate(cad_windows):
         wx = win['x'] - center_x
         wz = -(win['y'] - center_y)
         w_w = win.get('width', 1.50)
+        w_thick = win.get('thick', WALL_THICK)
         rot = win.get('rot', 0)
         is_horiz = not win.get('is_vertical', False)
+
+        # 1. Peitoril inferior (win_sill)
+        elements_3d.append({
+            "id": f"win_sill_{idx}",
+            "type": "wall",
+            "position": [round(wx, 3), round(WIN_SILL_H / 2.0, 3), round(wz, 3)],
+            "size": [round(w_w, 3) if is_horiz else w_thick, WIN_SILL_H, w_thick if is_horiz else round(w_w, 3)],
+            "is_exterior": True
+        })
+        # 2. Janela (esquadria + vidro)
         elements_3d.append({
             "id": f"win_{idx}",
             "type": "window",
             "position": [round(wx, 3), 1.60, round(wz, 3)],
-            "size": [round(w_w, 3) if is_horiz else WALL_THICK, 1.20, WALL_THICK if is_horiz else round(w_w, 3)],
+            "size": [round(w_w, 3) if is_horiz else w_thick, 1.20, w_thick if is_horiz else round(w_w, 3)],
             "rotation": rot
+        })
+        # 3. Verga superior (win_lintel)
+        elements_3d.append({
+            "id": f"win_lintel_{idx}",
+            "type": "wall",
+            "position": [round(wx, 3), round(WALL_HEIGHT - WIN_LINTEL_H / 2.0, 3), round(wz, 3)],
+            "size": [round(w_w, 3) if is_horiz else w_thick, WIN_LINTEL_H, w_thick if is_horiz else round(w_w, 3)],
+            "is_exterior": True
         })
 
     # Degraus de Escada (ARQ3) - Nivelados no piso (altura 0.04m) para circulação 100% limpa e desobstruída
@@ -1136,8 +1117,12 @@ Retorne EXCLUSIVAMENTE um objeto JSON válido (sem markdown, sem crases):
             furn_id += 1
 
     # Ponto de spawn inteligente dentro da Sala de Estar para navegação em 1ª pessoa
+    estar_block = next((b for b in inserts if b['name'] == 'ESTAR'), None)
     living_room = next((r for r in ai_data.get('rooms', []) if 'estar' in r.get('name', '').lower() or 'sala' in r.get('name', '').lower()), None)
-    if living_room and 'center' in living_room:
+    if estar_block:
+        sp_x = round(estar_block['x'] - center_x, 3)
+        sp_z = round(-(estar_block['y'] - center_y), 3)
+    elif living_room and 'center' in living_room:
         sp_x = round(living_room['center'][0] - center_x, 3)
         sp_z = round(-(living_room['center'][1] - center_y), 3)
     elif ai_data.get('rooms') and 'center' in ai_data['rooms'][0]:
