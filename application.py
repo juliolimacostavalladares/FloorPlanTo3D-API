@@ -2,12 +2,15 @@ import os
 import io
 import json
 import base64
+from datetime import datetime
 import requests
 from PIL import Image
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 ROOT_DIR = os.path.abspath("./")
+SAVED_PLANS_DIR = os.path.join(ROOT_DIR, "saved_plans")
+os.makedirs(SAVED_PLANS_DIR, exist_ok=True)
 
 application = Flask(__name__)
 cors = CORS(application, resources={r"/*": {"origins": "*"}})
@@ -377,7 +380,56 @@ def index():
 
 @application.route('/api/plans', methods=['GET'])
 def get_plans():
-    return jsonify([])
+    plans = []
+    if os.path.exists(SAVED_PLANS_DIR):
+        files = [f for f in os.listdir(SAVED_PLANS_DIR) if f.endswith('.json')]
+        files.sort(key=lambda x: os.path.getmtime(os.path.join(SAVED_PLANS_DIR, x)), reverse=True)
+        for fname in files:
+            fpath = os.path.join(SAVED_PLANS_DIR, fname)
+            try:
+                with open(fpath, 'r', encoding='utf-8') as f:
+                    content = json.load(f)
+                    pid = content.get('plan_id') or os.path.splitext(fname)[0]
+                    pname = (content.get('ai_analysis') or {}).get('projeto_nome') or content.get('filename') or pid
+                    created_at = content.get('created_at') or datetime.fromtimestamp(os.path.getmtime(fpath)).strftime('%Y-%m-%d %H:%M:%S')
+                    plans.append({
+                        "id": pid,
+                        "title": pname,
+                        "filename": fname,
+                        "created_at": created_at,
+                        "path": f"http://localhost:5001/api/plans/{pid}"
+                    })
+            except Exception as e:
+                print(f"Erro ao ler plano {fname}: {e}")
+    return jsonify(plans)
+
+
+@application.route('/api/plans/<plan_id>', methods=['GET'])
+def get_plan_by_id(plan_id):
+    target = os.path.join(SAVED_PLANS_DIR, f"{plan_id}.json")
+    if not os.path.exists(target):
+        for f in os.listdir(SAVED_PLANS_DIR):
+            if f == plan_id or f == f"{plan_id}.json":
+                target = os.path.join(SAVED_PLANS_DIR, f)
+                break
+    if os.path.exists(target):
+        with open(target, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        return jsonify(data)
+    return jsonify({"error": "Plano não encontrado"}), 404
+
+
+@application.route('/api/plans/latest', methods=['GET'])
+def get_latest_plan():
+    if os.path.exists(SAVED_PLANS_DIR):
+        files = [f for f in os.listdir(SAVED_PLANS_DIR) if f.endswith('.json')]
+        if files:
+            files.sort(key=lambda x: os.path.getmtime(os.path.join(SAVED_PLANS_DIR, x)), reverse=True)
+            fpath = os.path.join(SAVED_PLANS_DIR, files[0])
+            with open(fpath, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            return jsonify(data)
+    return jsonify({"error": "Nenhum plano salvo encontrado"}), 404
 
 
 @application.route('/', methods=['POST'])
@@ -405,6 +457,20 @@ def prediction():
 
         viewer_3d = build_3d_viewer_data(bbx, class_ids, raw_ai, w, h, b64_img)
         data.update(viewer_3d)
+
+        # Persistência do plano gerado
+        plan_id = f"plan_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        data['plan_id'] = plan_id
+        data['created_at'] = datetime.now().strftime('%d/%m/%Y %H:%M:%S')
+        data['filename'] = getattr(file_obj, 'filename', f"{plan_id}.png")
+
+        try:
+            plan_path = os.path.join(SAVED_PLANS_DIR, f"{plan_id}.json")
+            with open(plan_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False)
+            print(f"==> Planta salva com sucesso no disco: {plan_path}")
+        except Exception as save_err:
+            print(f"Aviso ao salvar plano: {save_err}")
 
         return jsonify({
             "status": "success",
